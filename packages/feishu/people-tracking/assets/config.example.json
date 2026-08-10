@@ -1,0 +1,45 @@
+{
+  "schema_version": "people-tracking-config-v1",
+  "runtime": {"mode": "auto"},
+  "sources": [
+    {"kind": "local_file", "path": "/controlled/path/synthetic-people.md"}
+  ],
+  "source_routes": [
+    {
+      "url": "https://example.org/people/example",
+      "preferred_route": "direct",
+      "follow_meta_refresh": true,
+      "alternate_routes": [
+        {"route": "raw_html", "url": "https://www.example.org/people/example"}
+      ],
+      "curation_note": "Versioned credential-free public fallback"
+    }
+  ],
+  "field_mapping": {
+    "name": "Name",
+    "secondary_id": "External ID",
+    "aliases": "Aliases",
+    "school": "School",
+    "research_focus": "Research",
+    "stage": "Stage",
+    "homepage": "Homepage",
+    "scholar": "Scholar",
+    "github": "GitHub",
+    "linkedin": "LinkedIn"
+  },
+  "master_database": {"mode": "local_or_api"},
+  "outputs": {
+    "document": {"enabled": true},
+    "message": {"enabled": true, "target_kind": "current_chat"}
+  },
+  "schedule": {
+    "timezone": "Asia/Shanghai",
+    "scan": "weekly",
+    "daily_digest": "18:00",
+    "weekly_digest": "MON 08:30"
+  },
+  "apis": {
+    "deepseek": {"enabled": false, "model": "deepseek-v4-flash"},
+    "search": []
+  }
+}

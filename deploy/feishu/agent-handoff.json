@@ -1,0 +1,26 @@
+{
+  "schema_version": "people-tracking-feishu-handoff-v1",
+  "release": "@@VERSION@@",
+  "first_read": "AGENT_START_HERE.md",
+  "entrypoints": {
+    "verify": ["python3", "verify_release.py"],
+    "doctor": ["python3", "install_bundle.py", "--doctor"],
+    "dry_run": ["python3", "install_bundle.py", "--dry-run"],
+    "apply": ["python3", "install_bundle.py", "--apply"],
+    "onboarding": ["people-tracking-feishu", "onboarding", "--json"],
+    "bootstrap": ["people-tracking-feishu", "bootstrap", "--confirmation", "确认启用", "--json"]
+  },
+  "confirmation_phrases": {
+    "enable": "确认启用",
+    "deepseek_smoke": "确认运行DeepSeek烟测",
+    "sandbox_e2e": "确认运行私有沙箱E2E",
+    "cleanup": "确认清理测试对象"
+  },
+  "never": [
+    "read_or_echo_secret_values",
+    "modify_existing_agent_or_feishu_configuration",
+    "network_install_dependencies_without_confirmation",
+    "import_or_schedule_before_enable_confirmation",
+    "claim_real_e2e_without_readback_evidence"
+  ]
+}

@@ -1,0 +1,48 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Check immutable version tag
+        run: test "${GITHUB_REF_NAME}" = "v$(cat VERSION)"
+      - name: Install offline test dependencies
+        run: |
+          python -m pip install pytest
+          python -m pip install --no-index vendor/wheels/pypinyin-0.55.0-py2.py3-none-any.whl
+      - name: Validate, test, build and verify
+        run: |
+          python scripts/validate_portable_skill.py
+          python -m pytest -q tests
+          python scripts/build_feishu_release.py --output-dir dist
+          python scripts/build_feishu_release.py --output-dir dist-second
+          version="$(cat VERSION)"
+          sha256sum "dist/people-tracking-feishu-${version}.zip" | cut -d' ' -f1 > first.digest
+          sha256sum "dist-second/people-tracking-feishu-${version}.zip" | cut -d' ' -f1 > second.digest
+          diff -u first.digest second.digest
+          mkdir unpack
+          unzip -q "dist/people-tracking-feishu-${version}.zip" -d unpack
+          python "unpack/people-tracking-feishu-${version}/verify_release.py"
+          PYTHONPATH="unpack/people-tracking-feishu-${version}/runtime:unpack/people-tracking-feishu-${version}/vendor/wheels/pypinyin-0.55.0-py2.py3-none-any.whl" \
+            python "unpack/people-tracking-feishu-${version}/offline_self_test.py"
+      - name: Publish immutable release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          version="$(cat VERSION)"
+          gh release create "v${version}" \
+            "dist/people-tracking-feishu-${version}.zip" \
+            "dist/people-tracking-feishu-${version}.zip.sha256" \
+            --verify-tag --title "People Tracking Feishu ${version}" \
+            --notes-file deploy/feishu/CHANGELOG.md
