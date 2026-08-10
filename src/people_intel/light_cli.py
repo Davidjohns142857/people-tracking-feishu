@@ -535,7 +535,12 @@ def _safe_registered_url(value: object) -> str | None:
         key.casefold().replace("-", "_")
         for key, _ in urllib.parse.parse_qsl(parsed.query, keep_blank_values=True)
     }
-    if query_names & REGISTERED_CREDENTIAL_QUERY_NAMES:
+    decoded_query = urllib.parse.unquote_plus(parsed.query)
+    raw_query_names = {
+        match.group(1).casefold().replace("-", "_")
+        for match in re.finditer(r"(?:^|[&;])([^=&;]+)=", decoded_query)
+    }
+    if (query_names | raw_query_names) & REGISTERED_CREDENTIAL_QUERY_NAMES:
         return None
     return url
 
