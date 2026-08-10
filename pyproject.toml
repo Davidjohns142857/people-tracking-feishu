@@ -1,0 +1,36 @@
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "people-intel-temporal-memory"
+version = "0.3.0"
+description = "Append-only, bitemporal knowledge graph memory for people intelligence."
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+  "fastapi>=0.109",
+  "pypinyin>=0.55,<1",
+  "pydantic>=2.8",
+  "python-dotenv>=1.0",
+  "uvicorn>=0.27",
+]
+
+[project.optional-dependencies]
+postgres = ["psycopg[binary]>=3.2"]
+neo4j = ["neo4j>=5.20"]
+cognee = ["cognee[fastembed]>=1.4,<1.5", "litellm>=1.83.7,<1.92"]
+feishu = ["lark-oapi>=1.7,<1.8"]
+dev = ["httpx>=0.28", "pytest>=7.4"]
+
+[project.scripts]
+people-intel = "people_intel.cli:main"
+people-tracker-lite = "people_intel.light_cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+addopts = "-q"

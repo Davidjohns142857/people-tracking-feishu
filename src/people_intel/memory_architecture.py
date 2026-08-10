@@ -1,0 +1,111 @@
+from __future__ import annotations
+
+from people_intel.schemas import (
+    CogneeArchitectureDefinition,
+    GraphLegendDefinition,
+    MemoryArchitectureDefinition,
+    MemoryLayerDefinition,
+    MemoryWriteStepDefinition,
+)
+
+
+MEMORY_ARCHITECTURE = MemoryArchitectureDefinition(
+    architecture_version="people-intel-memory-v1",
+    title_zh="以不可变证据和双时态 Assertion 为核心的人物知识库",
+    knowledge_unit_zh="Person/Entity → Assertion → Entity/Literal，并由 Assertion → EvidenceSpan → SourceDocumentVersion 回到原文。",
+    authority_rule_zh="只有带 SHA-256 的原文对象与 PostgreSQL 追加账本具有权威性；Neo4j、Cognee、向量索引和 Working View 都可重建。",
+    layers=[
+        MemoryLayerDefinition(
+            layer_id="source-authority",
+            title_zh="不可变原文层",
+            role_zh="保存每一次抓取或导入的具体内容版本，证明系统当时看到了什么。",
+            stores_zh=["原始 API/HTML/PDF/Markdown", "SHA-256", "SourceDocumentVersion 版本链"],
+            authoritative=True,
+            rebuildable=False,
+            rebuild_source_zh="原始内容本身就是根证据，旧版本永不覆盖。",
+            runtime_component_id="object-store",
+            endpoint_paths=["POST /v1/source-documents", "GET /v1/source-documents/{source_version_id}"],
+        ),
+        MemoryLayerDefinition(
+            layer_id="temporal-ledger",
+            title_zh="双时态知识账本",
+            role_zh="追加保存 Entity、EvidenceSpan、Assertion、Annotation、首次建档 ReviewDecision、身份关系和派生依赖。",
+            stores_zh=["valid_time", "transaction_time", "冲突 Assertion", "ReviewBatch/ReviewItem/ReviewDecision", "人工裁决"],
+            authoritative=True,
+            rebuildable=False,
+            rebuild_source_zh="PostgreSQL 账本是结构化解释的权威历史。",
+            runtime_component_id="ledger",
+            endpoint_paths=["POST /v1/graph/query", "GET /v1/entities/{entity_id}/working-view", "GET /v1/initial-reviews"],
+        ),
+        MemoryLayerDefinition(
+            layer_id="graph-projection",
+            title_zh="Neo4j 图投影",
+            role_zh="把实体—Assertion—证据关系投影成适合图遍历、团队形成和信号规则的结构。",
+            stores_zh=["实体关系图", "Assertion 路径", "信号图模式"],
+            authoritative=False,
+            rebuildable=True,
+            rebuild_source_zh="可从 PostgreSQL Assertion 与 EvidenceSpan 全量重建。",
+            runtime_component_id="neo4j",
+            endpoint_paths=["GET /v1/demo/graph", "GET /v1/demo/story-sessions/{session_id}/graph-delta"],
+        ),
+        MemoryLayerDefinition(
+            layer_id="cognee-projection",
+            title_zh="Cognee 图与向量检索投影",
+            role_zh="对已保存的规范化原文执行 temporal cognify，并用向量、图和时间检索找回相关上下文。",
+            stores_zh=["文档切分", "embedding", "Cognee graph", "temporal recall 索引"],
+            authoritative=False,
+            rebuildable=True,
+            rebuild_source_zh="清空后可从 SourceDocumentVersion 重新 remember/cognify。",
+            runtime_component_id="cognee",
+            endpoint_paths=["GET /v1/cognee/status", "POST /v1/source-documents/{source_version_id}/cognify", "POST /v1/cognee/recall"],
+        ),
+        MemoryLayerDefinition(
+            layer_id="working-delivery",
+            title_zh="工作视图与交付层",
+            role_zh="在指定 valid_at/known_at 下选择当前展示项，并生成 Signal、日报和飞书镜像。",
+            stores_zh=["Working View", "Signal", "日报/周报", "飞书人物镜像"],
+            authoritative=False,
+            rebuildable=True,
+            rebuild_source_zh="由账本、排序策略和信号规则重新计算。",
+            runtime_component_id="feishu",
+            endpoint_paths=["GET /v1/signals", "GET /v1/entities/{entity_id}/working-view"],
+        ),
+    ],
+    cognee=CogneeArchitectureDefinition(
+        integration_mode_zh="旁路投影：先写权威原文与账本，再异步 cognify；Cognee 故障不阻断知识写入。",
+        ingestion_call="cognee.remember(content, dataset_name, temporal_cognify=True, self_improvement=False)",
+        retrieval_call="cognee.recall(query_type=SearchType.TEMPORAL, datasets=[dataset_name], top_k=10)",
+        dataset_strategy_zh="当前 Sandbox 使用 people-intel-sandbox；生产可按租户或权限域拆分，不能按每个人创建孤立数据集。",
+        graph_role_zh="补充文档语义关系和跨文档召回，不替代 people-intel-v1 Predicate Ontology。",
+        embedding_role_zh="让人物别名、研究主题、项目和新闻能够按语义相似度召回。",
+        temporal_role_zh="检索内容出现或被系统获知的时间上下文；最终 valid_time/transaction_time 仍由 Assertion 账本保存。",
+        output_rule_zh="remember/recall 输出只能成为候选上下文或 Derived Assertion 输入，不能直接写 human_confirmed Assertion。",
+        authority_zh="projection_only / retrieval_projection_only",
+        self_improvement=False,
+        rebuild_policy_zh="删除 Cognee 图与向量库后，遍历 SourceDocumentVersion 重新 cognify；权威历史不受影响。",
+        current_limitations_zh=[
+            "当前 Sandbox 使用 Gemini 3 Flash Preview 做 LLM 抽取，本地 FastEmbed + SQLite/Kuzu/LanceDB 保存投影。",
+            "当前适配器记录 ExtractionRun、content_hash、耗时和本地存储快照，但不直接确认 Assertion。",
+            "recall 结果到候选 Assertion 的自动晋升流水线仍需后续实现证据门控与评测。",
+        ],
+    ),
+    write_path=[
+        MemoryWriteStepDefinition(step_id="capture", position=1, title_zh="保存新原文", input_zh="连接器原始响应与规范化 Markdown", action_zh="计算 SHA-256 并追加 SourceDocumentVersion", output_zh="不可变原文版本与 previous_version_id", authority_effect_zh="增加根证据", cognee_role_zh="此时尚未调用 Cognee", endpoint_path="POST /v1/source-documents", event_type="source.versioned"),
+        MemoryWriteStepDefinition(step_id="cognify", position=2, title_zh="建立 Cognee 检索投影", input_zh="已保存的 SourceDocumentVersion 正文", action_zh="remember + temporal_cognify + embedding/graph indexing", output_zh="可重建的 Cognee dataset/pipeline metadata", authority_effect_zh="不增加权威事实", cognee_role_zh="核心执行步骤；失败只影响召回", endpoint_path="POST /v1/source-documents/{source_version_id}/cognify", event_type="extraction.requested"),
+        MemoryWriteStepDefinition(step_id="evidence", position=3, title_zh="定位原文证据", input_zh="变化片段、Cognee 召回上下文或抽取器候选", action_zh="创建精确 locator 与 quote hash", output_zh="EvidenceSpan", authority_effect_zh="增加可审计证据锚点", cognee_role_zh="可协助找相关上下文，但不能替代 span", event_type="extraction.completed"),
+        MemoryWriteStepDefinition(step_id="validate", position=4, title_zh="经过身份、本体和时间门", input_zh="候选实体—谓词—实体与历史时间线", action_zh="IdentityCluster 消歧、谓词校验、双时态和冲突判断", output_zh="可写入、待裁决或拒绝的候选关系", authority_effect_zh="尚未写事实", cognee_role_zh="Cognee 关系只作为候选输入"),
+        MemoryWriteStepDefinition(step_id="assert", position=5, title_zh="追加 Assertion", input_zh="通过门控且有 EvidenceSpan 的候选关系", action_zh="只追加 Assertion，不覆盖旧关系", output_zh="带 valid_time/transaction_time 的最小知识单元", authority_effect_zh="增加结构化权威解释", cognee_role_zh="无直接写权限", event_type="assertion.appended"),
+        MemoryWriteStepDefinition(step_id="project", position=6, title_zh="更新图与当前视图", input_zh="新增 Assertion、Annotation 和策略版本", action_zh="投影 Neo4j 并重算 Working View", output_zh="局部图增量、选中项、备选项和理由", authority_effect_zh="只更新可重建视图", cognee_role_zh="后续 recall 可检索到新原文"),
+        MemoryWriteStepDefinition(step_id="signal", position=7, title_zh="生成信号与集中报告", input_zh="图增量、ChangeSet、冲突和来源覆盖", action_zh="运行图模式、去重排序并生成日报条目", output_zh="Signal、飞书预览和待裁决项", authority_effect_zh="增加可重算 Signal，不改变事实", cognee_role_zh="可用于摘要上下文，不作为信号触发的唯一证据", event_type="signal.emitted"),
+    ],
+    graph_legend=[
+        GraphLegendDefinition(node_type="entity", title_zh="实体", role_zh="人物、机构、论文、公司、项目等稳定对象。"),
+        GraphLegendDefinition(node_type="assertion", title_zh="Assertion", role_zh="带证据与双时态的实体—谓词—实体/字面量陈述。"),
+        GraphLegendDefinition(node_type="evidence", title_zh="EvidenceSpan", role_zh="能够定位回原文的具体短摘录。"),
+        GraphLegendDefinition(node_type="source", title_zh="原文版本", role_zh="带 hash、抓取时间和版本链的不可变内容。"),
+        GraphLegendDefinition(node_type="literal", title_zh="类型化值", role_zh="日期、金额、URL 等不是独立实体的对象值。"),
+    ],
+)
+
+
+__all__ = ["MEMORY_ARCHITECTURE"]

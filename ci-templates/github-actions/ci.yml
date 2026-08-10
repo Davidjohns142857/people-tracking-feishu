@@ -1,0 +1,41 @@
+name: CI
+
+on:
+  push:
+    branches: [main, "agent/**"]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install offline test dependencies
+        run: |
+          python -m pip install pytest
+          python -m pip install --no-index vendor/wheels/pypinyin-0.55.0-py2.py3-none-any.whl
+      - name: Validate source and Skill
+        run: python scripts/validate_portable_skill.py
+      - name: Run focused regression
+        run: python -m pytest -q tests
+      - name: Build twice and require identical archives
+        run: |
+          mkdir -p build-a build-b unpack
+          python scripts/build_feishu_release.py --output-dir build-a
+          python scripts/build_feishu_release.py --output-dir build-b
+          version="$(cat VERSION)"
+          sha256sum "build-a/people-tracking-feishu-${version}.zip" > build-a.sha
+          sha256sum "build-b/people-tracking-feishu-${version}.zip" > build-b.sha
+          cut -d' ' -f1 build-a.sha > build-a.digest
+          cut -d' ' -f1 build-b.sha > build-b.digest
+          diff -u build-a.digest build-b.digest
+          unzip -q "build-a/people-tracking-feishu-${version}.zip" -d unpack
+          python "unpack/people-tracking-feishu-${version}/verify_release.py"
+          PYTHONPATH="unpack/people-tracking-feishu-${version}/runtime:unpack/people-tracking-feishu-${version}/vendor/wheels/pypinyin-0.55.0-py2.py3-none-any.whl" \
+            python "unpack/people-tracking-feishu-${version}/offline_self_test.py"

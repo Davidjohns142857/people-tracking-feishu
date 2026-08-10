@@ -1,0 +1,4 @@
+interface:
+  display_name: "Feishu People Tracking"
+  short_description: "Reliable public-profile tracking for Feishu agents"
+  default_prompt: "Use $people-tracking to configure and strictly verify a reliable Feishu public-profile tracking run."
