@@ -267,6 +267,49 @@ def test_normal_page_that_mentions_captcha_does_not_trigger_fallback(monkeypatch
     assert observation.retrieval_mode == "direct"
 
 
+def test_meta_refresh_refuses_non_public_target(monkeypatch) -> None:
+    profile_url = "https://profiles.example/alice"
+    shell = b"""
+    <html><head>
+    <meta http-equiv="refresh" content="0; url=http://169.254.169.254/latest/meta-data/">
+    <title>Alice Zhang</title></head><body><h1>Alice Zhang</h1></body></html>
+    """
+    calls: list[str] = []
+
+    def fake_http_fetch(url, *, headers, timeout=30):
+        calls.append(url)
+        if url != profile_url:
+            raise AssertionError("unsafe meta-refresh target must not be fetched")
+        return FetchObservation(body=shell, final_url=url)
+
+    monkeypatch.setattr(light_cli, "_http_fetch", fake_http_fetch)
+    observation = light_cli._fetch(
+        {
+            "kind": "homepage",
+            "url": profile_url,
+            "retrieval_config": {"follow_meta_refresh": True},
+        }
+    )
+
+    assert calls == [profile_url]
+    assert observation.body == shell
+    assert observation.retrieval_mode == "meta_refresh_rejected"
+
+
+def test_registered_routes_reject_token_and_signature_queries() -> None:
+    routes = light_cli._alternate_route_specs(
+        {
+            "alternate_routes": [
+                "https://example.com/profile?refresh_token=secret",
+                "https://example.com/profile?X-Goog-Signature=secret",
+                "https://example.com/profile?view=public",
+            ]
+        }
+    )
+
+    assert routes == [("auto", "https://example.com/profile?view=public")]
+
+
 def test_captcha_without_registered_alternate_is_not_bypassed(monkeypatch) -> None:
     profile_url = "https://profiles.example/alice"
     calls: list[str] = []

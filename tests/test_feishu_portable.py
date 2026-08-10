@@ -657,6 +657,11 @@ def test_scan_parser_keeps_force_full_fetch_independent_and_filters_kinds():
     assert body_only.source_kind == ["homepage"]
     with pytest.raises(SystemExit):
         parser().parse_args(["scan", "--homepage-retries", "2"])
+    for invalid_backoff in ("-0.1", "nan", "inf"):
+        with pytest.raises(SystemExit):
+            parser().parse_args(
+                ["scan", "--homepage-backoff-seconds", invalid_backoff]
+            )
 
 
 def test_scan_periodically_fetches_full_body_and_reports_retry_cost(
@@ -713,12 +718,22 @@ def test_scan_periodically_fetches_full_body_and_reports_retry_cost(
         assert all(row["_force_full_fetch"] is True for row in fetched)
         assert metrics["force_all"] is False
         assert metrics["force_full_fetch"] is False
+        assert metrics["sources_enabled"] == 1
         assert metrics["sources_planned"] == metrics["sources_attempted"] == 1
         assert metrics["full_fetch_planned"] == metrics["full_fetch_attempted"] == 1
         assert metrics["homepage_planned"] == metrics["homepage_attempted"] == 1
         assert metrics["homepage_retries"] == 1
         assert len(waits) == 1
         assert metrics["homepage_retry_wait_seconds"] == round(waits[0], 6)
+        assert result["validation"]["coverage"] == {
+            "force_all": False,
+            "sources_enabled": 1,
+            "sources_planned": 1,
+            "sources_attempted": 1,
+            "sources_observed": 1,
+            "full_fetch_planned": 1,
+            "full_fetch_attempted": 1,
+        }
     finally:
         state.close()
 
@@ -731,6 +746,9 @@ def test_scan_periodically_fetches_full_body_and_reports_retry_cost(
         (410, "gone", None),
         (429, "rate limited", None),
         (0, "certificate verify failed: hostname mismatch", None),
+        (0, "[SSL: WRONG_VERSION_NUMBER] wrong version number", None),
+        (0, "SSLV3_ALERT_HANDSHAKE_FAILURE", None),
+        (0, "TLSV1_ALERT_PROTOCOL_VERSION", None),
         (503, None, "<html>CAPTCHA challenge</html>"),
         (503, None, "<html>authentication wall; sign in to continue</html>"),
     ],
@@ -820,7 +838,10 @@ def test_force_all_excludes_retired_sources_and_honors_source_kind(
         )
         assert fetched == [active["sources"][0]["source_id"]]
         assert result["metrics"]["source_kinds"] == ["homepage"]
+        assert result["metrics"]["sources_enabled"] == 1
         assert result["metrics"]["sources_planned"] == 1
+        assert result["validation"]["coverage"]["sources_enabled"] == 1
+        assert result["validation"]["passed"] is True
     finally:
         state.close()
 
@@ -868,6 +889,56 @@ def test_scan_validation_failure_keeps_written_observation(
         assert count == 1
     finally:
         state.close()
+
+
+def test_scan_coverage_validation_rejects_partial_force_all() -> None:
+    import people_tracking_feishu.tracking as tracking_module
+
+    validation = tracking_module._scan_validation(
+        [],
+        max_error_rate=1.0,
+        force_all=True,
+        sources_enabled=2,
+        sources_planned=1,
+        sources_attempted=1,
+        full_fetch_planned=1,
+        full_fetch_attempted=0,
+    )
+
+    assert validation["passed"] is False
+    assert validation["coverage"]["sources_enabled"] == 2
+    assert any("planned 1 of 2 enabled" in reason for reason in validation["reasons"])
+    assert any("full-body fetch attempted 0 of 1" in reason for reason in validation["reasons"])
+
+
+def test_scan_cli_returns_nonzero_and_false_envelope_when_validation_fails(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    import people_tracking_feishu.cli as cli_module
+
+    validation = {
+        "passed": False,
+        "reasons": ["synthetic validation failure"],
+    }
+    monkeypatch.setattr(cli_module, "_runtime_paths", lambda args: object())
+    monkeypatch.setattr(
+        cli_module,
+        "command_scan",
+        lambda args, paths: {
+            "run_id": "run_synthetic",
+            "validation": validation,
+            "outcomes": [],
+        },
+    )
+
+    exit_code = cli_module.main(["scan", "--json"])
+    payload = json.loads(capsys.readouterr().out)
+
+    assert exit_code == 3
+    assert payload["ok"] is False
+    assert payload["error"]["type"] == "ScanValidationFailed"
+    assert payload["data"]["run_id"] == "run_synthetic"
 
 
 def test_bootstrap_does_not_become_ready_when_baseline_validation_fails(
@@ -921,6 +992,8 @@ def test_bootstrap_does_not_become_ready_when_baseline_validation_fails(
         "https://127.0.0.1/profile",
         "https://example.org:8443/profile",
         "https://example.org/profile?access_token=secret",
+        "https://example.org/profile?refresh_token=secret",
+        "https://example.org/profile?X-Goog-Signature=secret",
         "file:///tmp/profile",
     ],
 )
@@ -936,6 +1009,29 @@ def test_source_routes_reject_non_public_or_credentialed_urls(
             "alternate_urls": [unsafe_url],
         }
     ]
+    with pytest.raises(ConfigError):
+        normalize_answers(payload)
+
+
+@pytest.mark.parametrize(
+    "unsupported_route",
+    [
+        {"alternate_routes": [{"route": "public_json_api", "url": "https://example.org/api"}]},
+        {"tracked_fields": ["title", "modified"]},
+    ],
+)
+def test_source_routes_reject_documented_but_unimplemented_options(
+    tmp_path: Path,
+    unsupported_route: dict,
+) -> None:
+    payload = answers(tmp_path / "people.md")
+    payload["source_routes"] = [
+        {
+            "url": "https://example.org/people/synthetic",
+            **unsupported_route,
+        }
+    ]
+
     with pytest.raises(ConfigError):
         normalize_answers(payload)
 

@@ -45,6 +45,29 @@ ALTERNATE_ROUTE_NAMES = {
     "hf_user_overview",
     "public_json_api",
 }
+REGISTERED_CREDENTIAL_QUERY_NAMES = frozenset(
+    {
+        "access_token",
+        "api_key",
+        "apikey",
+        "auth",
+        "auth_token",
+        "authorization",
+        "id_token",
+        "key",
+        "password",
+        "refresh_token",
+        "secret",
+        "sig",
+        "signature",
+        "token",
+        "x_amz_credential",
+        "x_amz_security_token",
+        "x_amz_signature",
+        "x_goog_credential",
+        "x_goog_signature",
+    }
+)
 CUHK_TLS12_STATIC_RSA_HOSTS = frozenset(
     {
         "myweb.cuhk.edu.cn",
@@ -495,16 +518,25 @@ def _safe_registered_url(value: object) -> str | None:
         return None
     if port not in {None, 80, 443}:
         return None
+    if parsed.fragment:
+        return None
     hostname = parsed.hostname.casefold().rstrip(".")
     if hostname == "localhost" or hostname.endswith((".localhost", ".local")):
         return None
     try:
         address = ipaddress.ip_address(hostname)
     except ValueError:
-        pass
+        if "." not in hostname or re.fullmatch(r"[0-9.]+", hostname):
+            return None
     else:
         if not address.is_global:
             return None
+    query_names = {
+        key.casefold().replace("-", "_")
+        for key, _ in urllib.parse.parse_qsl(parsed.query, keep_blank_values=True)
+    }
+    if query_names & REGISTERED_CREDENTIAL_QUERY_NAMES:
+        return None
     return url
 
 
@@ -1359,11 +1391,15 @@ def _fetch(source: dict[str, object]) -> FetchObservation:
         )
         if refresh:
             target = urllib.parse.urljoin(url, html.unescape(refresh.group(1).strip()))
-            followed = _http_fetch(target, headers=headers)
-            if followed.body is not None:
-                followed.retrieval_mode = "meta_refresh"
-                direct = followed
-                direct_fingerprint = _observation_fingerprint(direct)
+            registered_target = _safe_registered_url(target)
+            if registered_target:
+                followed = _http_fetch(registered_target, headers=headers)
+                if followed.body is not None:
+                    followed.retrieval_mode = "meta_refresh"
+                    direct = followed
+                    direct_fingerprint = _observation_fingerprint(direct)
+            else:
+                direct.retrieval_mode = "meta_refresh_rejected"
     if direct.status_code == 304 or (
         direct.body is not None and direct_fingerprint is None
     ):

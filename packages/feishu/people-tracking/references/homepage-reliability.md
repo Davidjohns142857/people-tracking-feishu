@@ -39,7 +39,7 @@ Homepage 异常分成六类，不能统一写成“来源不可用”：
 ```
 
 允许的路由字段是 `preferred_route`、`alternate_routes`、`alternate_urls`、
-`follow_meta_refresh`、`wordpress_endpoint`、`site_name` 和 `tracked_fields`。URL 必须是匿名公开
+`follow_meta_refresh`、`wordpress_endpoint` 和 `site_name`。URL 必须是匿名公开
 HTTP(S)，不得含 credentials、token query、私网/本机 host 或非 80/443 端口。
 
 先运行 `source-routes --json` 检查 exact match、动作与安全校验，再运行

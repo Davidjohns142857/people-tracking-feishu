@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -33,13 +34,25 @@ _HOMEPAGE_PERMANENT_ERROR_MARKERS = (
     "certificate verify failed",
     "certificate_verify_failed",
     "hostname mismatch",
+    "no shared cipher",
+    "no suitable key share",
     "login required",
     "not valid for",
+    "sslv3 alert handshake failure",
+    "sslv3_alert_handshake_failure",
     "self-signed certificate",
     "self signed certificate",
     "sign in to continue",
+    "tlsv1 alert handshake failure",
+    "tlsv1 alert insufficient security",
+    "tlsv1 alert protocol version",
+    "tlsv1_alert_protocol_version",
+    "unsupported protocol",
     "unable to get local issuer certificate",
     "unable to verify the first certificate",
+    "unsafe legacy renegotiation disabled",
+    "wrong version number",
+    "wrong_version_number",
 )
 _HOMEPAGE_RETRY_JITTER_RATIO = 0.25
 _HOMEPAGE_RETRY_BACKOFF_SECONDS = 1.0
@@ -206,6 +219,12 @@ def _scan_validation(
     outcomes: list[dict[str, Any]],
     *,
     max_error_rate: float,
+    force_all: bool,
+    sources_enabled: int,
+    sources_planned: int,
+    sources_attempted: int,
+    full_fetch_planned: int,
+    full_fetch_attempted: int,
 ) -> dict[str, Any]:
     if not 0.0 <= max_error_rate <= 1.0:
         raise ValueError("max_error_rate must be between 0 and 1")
@@ -216,21 +235,46 @@ def _scan_validation(
         or item.get("decision") in _ERROR_DECISIONS
     ]
     error_rate = len(errors) / len(outcomes) if outcomes else 0.0
-    passed = error_rate <= max_error_rate
+    reasons: list[str] = []
+    if error_rate > max_error_rate:
+        reasons.append(
+            f"source error rate {error_rate:.2%} exceeds the "
+            f"{max_error_rate:.2%} limit"
+        )
+    if force_all and sources_planned != sources_enabled:
+        reasons.append(
+            f"full scan planned {sources_planned} of {sources_enabled} enabled sources"
+        )
+    if sources_attempted != sources_planned:
+        reasons.append(
+            f"scan attempted {sources_attempted} of {sources_planned} planned sources"
+        )
+    if len(outcomes) != sources_attempted:
+        reasons.append(
+            f"scan observed {len(outcomes)} of {sources_attempted} attempted sources"
+        )
+    if full_fetch_attempted != full_fetch_planned:
+        reasons.append(
+            "full-body fetch attempted "
+            f"{full_fetch_attempted} of {full_fetch_planned} planned sources"
+        )
+    passed = not reasons
     return {
         "passed": passed,
         "max_error_rate": max_error_rate,
         "error_sources": len(errors),
         "observed_sources": len(outcomes),
         "error_rate": round(error_rate, 6),
-        "reasons": (
-            []
-            if passed
-            else [
-                f"source error rate {error_rate:.2%} exceeds the "
-                f"{max_error_rate:.2%} limit"
-            ]
-        ),
+        "coverage": {
+            "force_all": force_all,
+            "sources_enabled": sources_enabled,
+            "sources_planned": sources_planned,
+            "sources_attempted": sources_attempted,
+            "sources_observed": len(outcomes),
+            "full_fetch_planned": full_fetch_planned,
+            "full_fetch_attempted": full_fetch_attempted,
+        },
+        "reasons": reasons,
     }
 
 
@@ -252,7 +296,9 @@ def scan_due(
     if not 0.0 <= max_error_rate <= 1.0:
         raise ValueError("max_error_rate must be between 0 and 1")
     retry_limit = min(1, max(0, int(homepage_retries)))
-    retry_backoff = max(0.0, float(homepage_backoff_seconds))
+    retry_backoff = float(homepage_backoff_seconds)
+    if not math.isfinite(retry_backoff) or retry_backoff < 0:
+        raise ValueError("homepage_backoff_seconds must be a finite non-negative number")
     config_file = materialize_deepseek_config(paths, config)
     reviewer = None
     settings = DeepSeekSettings(enabled=False)
@@ -265,16 +311,21 @@ def scan_due(
     timing: dict[str, float] = {}
     opportunities: dict[str, int] = {}
     usage_before = reviewer.usage_snapshot() if reviewer else {}
+    enabled_sources = [
+        {**source, "person_key": person["person_key"]}
+        for person in state.tracker.list_people()
+        for source in person["sources"]
+        if int(source.get("tracking_enabled", 1)) == 1
+        and source.get("kind") in selected_kinds
+    ]
     selected_sources = (
-        [
-            {**source, "person_key": person["person_key"]}
-            for person in state.tracker.list_people()
-            for source in person["sources"]
-            if int(source.get("tracking_enabled", 1)) == 1
-            and source.get("kind") in selected_kinds
-        ]
+        enabled_sources
         if force_all
-        else state.tracker.list_due_sources(kinds=selected_kinds)
+        else [
+            source
+            for source in state.tracker.list_due_sources(kinds=selected_kinds)
+            if int(source.get("tracking_enabled", 1)) == 1
+        ]
     )
     sources, full_fetch_planned = _prepare_fetches(
         selected_sources,
@@ -329,10 +380,20 @@ def scan_due(
             key: max(0, int(usage_after.get(key, 0)) - int(usage_before.get(key, 0)))
             for key in usage_after
         }
-        validation = _scan_validation(outcomes, max_error_rate=max_error_rate)
+        validation = _scan_validation(
+            outcomes,
+            max_error_rate=max_error_rate,
+            force_all=force_all,
+            sources_enabled=len(enabled_sources),
+            sources_planned=len(sources),
+            sources_attempted=sources_attempted,
+            full_fetch_planned=full_fetch_planned,
+            full_fetch_attempted=full_fetch_attempted,
+        )
         metrics = {
             "tracker_run_id": tracker_run,
             "sources_due": len(sources),
+            "sources_enabled": len(enabled_sources),
             "sources_planned": len(sources),
             "sources_attempted": sources_attempted,
             "force_all": force_all,

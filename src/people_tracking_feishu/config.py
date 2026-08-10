@@ -31,7 +31,6 @@ ALTERNATE_PUBLIC_ROUTES = {
     "raw_html",
     "huggingface_user_overview",
     "hf_user_overview",
-    "public_json_api",
 }
 SOURCE_ROUTE_FIELDS = {
     "preferred_route",
@@ -40,22 +39,27 @@ SOURCE_ROUTE_FIELDS = {
     "follow_meta_refresh",
     "wordpress_endpoint",
     "site_name",
-    "tracked_fields",
 }
 _CREDENTIAL_QUERY_NAMES = {
     "access_token",
     "api_key",
     "apikey",
+    "auth_token",
     "auth",
     "authorization",
+    "id_token",
     "key",
     "password",
+    "refresh_token",
     "secret",
     "sig",
     "signature",
     "token",
+    "x-amz-security-token",
     "x-amz-credential",
     "x-amz-signature",
+    "x-goog-credential",
+    "x-goog-signature",
 }
 DEFAULT_FIELDS = {
     "name": "姓名",
@@ -320,17 +324,6 @@ def _validate_source_routes(payload: Any) -> None:
             or len(site_name.strip()) > 200
         ):
             raise ConfigError(f"{prefix}.site_name must be a non-empty string of at most 200 characters")
-        tracked_fields = route.get("tracked_fields")
-        if tracked_fields is not None and (
-            not isinstance(tracked_fields, list)
-            or len(tracked_fields) > 100
-            or any(
-                not isinstance(value, str) or not value.strip() or len(value.strip()) > 100
-                for value in tracked_fields
-            )
-        ):
-            raise ConfigError(f"{prefix}.tracked_fields must contain at most 100 short strings")
-
         alternate_urls = route.get("alternate_urls")
         if alternate_urls is not None:
             if not isinstance(alternate_urls, list) or len(alternate_urls) > 20:

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import platform
 import shutil
@@ -46,6 +47,16 @@ from .tracking import (
 ENABLE_PHRASE = "确认启用"
 SANDBOX_PHRASE = "确认运行私有沙箱E2E"
 DEEPSEEK_PHRASE = "确认运行DeepSeek烟测"
+
+
+def _nonnegative_finite_float(value: str) -> float:
+    try:
+        parsed = float(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("must be a number") from exc
+    if not math.isfinite(parsed) or parsed < 0:
+        raise argparse.ArgumentTypeError("must be finite and non-negative")
+    return parsed
 
 
 def _json_file(path: Path) -> Any:
@@ -1104,8 +1115,15 @@ def command_schedule_tick(args: argparse.Namespace, paths: RuntimePaths) -> dict
             scan_due_now = now - datetime.fromisoformat(last_scan) >= timedelta(days=7)
         if scan_due_now:
             result = scan_due(state, paths, config)
-            state.set_meta("scheduler_last_scan_at", now.isoformat())
             actions.append({"operation": "scan", "result": result})
+            if not result.get("validation", {}).get("passed", False):
+                return {
+                    "skipped": False,
+                    "validation_failed": True,
+                    "actions": actions,
+                    "next": "repair or replace failed sources, then rerun the scan",
+                }
+            state.set_meta("scheduler_last_scan_at", now.isoformat())
         for kind in ("daily", "weekly"):
             if not _digest_due_now(kind, now, config["schedule"]):
                 continue
@@ -1224,7 +1242,7 @@ def parser() -> argparse.ArgumentParser:
     )
     scan.add_argument(
         "--homepage-backoff-seconds",
-        type=float,
+        type=_nonnegative_finite_float,
         default=1.0,
         help="initial Homepage retry delay before deterministic jitter",
     )
@@ -1269,6 +1287,29 @@ def main(argv: list[str] | None = None) -> int:
             "schedule-tick": command_schedule_tick,
         }
         data = handlers[args.command](args, paths)
+        validation_failed = (
+            args.command == "scan"
+            and not data.get("validation", {}).get("passed", False)
+        ) or (
+            args.command == "bootstrap"
+            and data.get("status") == "baseline_validation_failed"
+        ) or (
+            args.command == "schedule-tick"
+            and bool(data.get("validation_failed"))
+        )
+        if validation_failed:
+            payload = {
+                "ok": False,
+                "command": args.command,
+                "version": __version__,
+                "data": data,
+                "error": {
+                    "type": "ScanValidationFailed",
+                    "message": "scan evidence was preserved, but strict validation failed",
+                },
+            }
+            print(json.dumps(payload, ensure_ascii=False, indent=2))
+            return 3
         payload = {"ok": True, "command": args.command, "version": __version__, "data": data}
         print(json.dumps(payload, ensure_ascii=False, indent=2))
         return 0

@@ -81,10 +81,10 @@
   `westlake_faculty_inline`。
 - `follow_meta_refresh`：是否跟随页面明确声明的公开 meta refresh。
 - `alternate_routes`：最多 20 个 `{route,url}`；`route` 只允许 `auto`、
-  `raw_html`、`huggingface_user_overview`/`hf_user_overview`、
-  `public_json_api`。
+  `raw_html`、`huggingface_user_overview`/`hf_user_overview`。Hugging Face
+  路由只接受精确的公开 `/api/users/<user>/overview` 端点。
 - `alternate_urls`：兼容旧配置的公开 URL 列表，等价于 `auto` route。
-- `wordpress_endpoint`、`site_name`、`tracked_fields`：WordPress REST 投影和稳定字段。
+- `wordpress_endpoint`、`site_name`：WordPress REST 投影端点和显示名称。
 
 所有 route URL 必须是 credential-free 的公开 HTTP(S) 地址：禁止用户名/密码、
 token 或签名 query、Cookie、Authorization、本机/私网 IP、`.local` 域名和非
