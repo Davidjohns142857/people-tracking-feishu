@@ -2,14 +2,14 @@
 
 ## 发布前离线验收
 
-- 全项目 270/270 与便携层 14/14 pytest 通过。
+- 全项目与便携层 pytest 由当次 CI/发布门重新执行；静态报告不保留会过期的计数。
 - 使用纯合成人物运行 Homepage `baseline → candidate → changed`。
 - 使用 fake `lark-cli 1.0.82` 验证 Base、Docs、消息全部先 dry-run，再实际写入。
 - 回读合成 Base/文档并验证消息幂等键。
 - 使用临时 HOME 验证 OpenClaw/Claude 双安装、重复安装、备份和回滚不修改预先存在的无关配置 hash。
 - DeepSeek 使用 fake transport 验证 `ambiguous_review` 与 `confirmed_summary`；不在发布构建中调用真实 key。
 
-可恢复 `bootstrap` 已覆盖直接导入、缺主页证据回填、OpenClaw 来源 bridge、可见总库 bridge、全量首次基线和重复恢复。包内自测 6/6、既有轻量跟踪对抗 11/11 通过；详细证据由 `INSTALLATION_REPORT.md` 记录。
+可恢复 `bootstrap` 已覆盖直接导入、缺主页证据回填、OpenClaw 来源 bridge、可见总库 bridge、全量首次基线和重复恢复。包内自测与轻量跟踪对抗测试的当次结果以 CI/发布日志为准；详细门禁由 `INSTALLATION_REPORT.md` 记录。
 
 ## 真实飞书私有沙箱
 

@@ -8,7 +8,7 @@ OpenClaw 或 Claude Agent，以 SQLite 保存确认基线、候选变化、来�
 
 ## Homepage 可靠性
 
-`0.8.0-portable.1` 把严格复扫所需能力带入便携运行时：
+`0.8.1-portable.1` 把严格复扫和状态安全所需能力带入便携运行时：
 
 - 调度范围与正文下载分离；`--force-all` 不再冒充正文重抓，`--force-full-fetch` 才跳过 304。
 - Homepage 只对瞬时传输错误和少数 5xx 最多重试一次；证书、WAF/CAPTCHA、403/404/410/429 不重试。
@@ -17,6 +17,8 @@ OpenClaw 或 Claude Agent，以 SQLite 保存确认基线、候选变化、来�
 - `source_routes[]` 可登记匿名公开 fallback、软退役或替换来源；历史来源、观察、候选和基线不删除。
 - 公开 route 拒绝 URL credentials、token query、私网/本机地址和非标准端口。
 - TLS 兼容只允许 exact-host 策略，并始终保留 CA 与 hostname 验证。
+- `acceptance`/`validation` 扫描不推进正式 baseline 或候选，同一 run 不重复计数。
+- Bridge 要求 nonce、预期 source refs 与哈希完整回填；裸 `all_ok=true` 不能将 bootstrap 标记为 ready。
 
 完整原因与处理矩阵见
 [`homepage-reliability.md`](packages/feishu/people-tracking/references/homepage-reliability.md)。

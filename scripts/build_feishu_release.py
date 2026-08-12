@@ -20,7 +20,7 @@ from typing import Any
 ROOT = Path(__file__).resolve().parents[1]
 VERSION = (ROOT / "VERSION").read_text(encoding="utf-8").strip()
 RELEASE_PREFIX = "people-tracking-feishu"
-SOURCE_DATE_EPOCH = 1786320000
+SOURCE_DATE_EPOCH = 1786579200
 PINNED_NPM_INTEGRITY = (
     "sha512-7jqwniqCtiunLPi2vypDu0aHSaPNeG93kRO9UZ9kywU/"
     "XSVSy/PH1L1GJfav1Goi95v3D8TjV5R+ttWnMEvjYQ=="

@@ -353,6 +353,15 @@ def test_homepage_canonical_url_preserves_meaningful_www_authority():
     ) == "https://github.com/alice"
 
 
+def test_homepage_canonical_url_preserves_functional_query_and_drops_tracking():
+    assert canonical_url(
+        "https://profiles.example/person?lang=zh&view=research&utm_source=newsletter&fbclid=x"
+    ) == "https://profiles.example/person?lang=zh&view=research"
+    assert canonical_url(
+        "https://pkuzqh.github.io/?utmsource=chatgpt.com"
+    ) == "https://pkuzqh.github.io/"
+
+
 def test_merges_name_variant_when_stable_anchor_matches(tmp_path):
     tracker = LightTracker(tmp_path / "tracker.sqlite3")
     first = tracker.add_person(

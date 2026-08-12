@@ -32,7 +32,7 @@ python3 scripts/skill_entry.py onboarding --answers /path/to/answers.json --json
 python3 scripts/skill_entry.py source-probe --json
 ```
 
-若 `source-probe` 返回 `agent_tool_bridge` actions，严格按 action 使用官方飞书插件做只读读取，将实际 schema/权限/记录数写成 bridge result，再运行 `source-probe --bridge-results <file>`。不得在未执行时伪造 `all_ok=true`。
+若 `source-probe` 返回 `agent_tool_bridge` actions，严格按 action 使用官方飞书插件做只读读取，将实际 schema/权限/记录数写成 bridge result，再运行 `source-probe --bridge-results <file>`。原样回传 action 中的 nonce、完整 expected refs 和 hash；缺项、重复或未知 ref 必须停止。不得在未执行时伪造 `all_ok=true`。
 
 向用户汇报来源、人物记录数、字段映射、输出目标、时区、调度、API 预算和失败项。
 
@@ -80,7 +80,7 @@ python3 scripts/skill_entry.py source-routes --json
 python3 scripts/skill_entry.py source-routes --apply --json
 ```
 
-无四类必要主页的人进入 intake issue，不进入主动跟踪。人工 Base 字段为权威；机器仅维护 SQLite 中的指纹、候选、来源健康、审计和投递状态。中文名、拼音、英文名和已确认 nickname 作为身份边，不要求 GitHub 显示名逐字相同。
+无四类必要主页的人进入 intake issue，不进入主动跟踪。人工 Base 字段为权威；incoming 值与非空人工字段冲突时只写 conflict，不覆盖人工值。机器仅维护 SQLite 中的指纹、候选、来源健康、审计和投递状态。中文名、拼音、英文名和已确认 nickname 作为身份边，不要求 GitHub 显示名逐字相同。
 
 执行到期扫描：
 
@@ -100,6 +100,9 @@ python3 scripts/skill_entry.py scan --force-all --force-full-fetch \
 Homepage 只对瞬时传输错误和少数 5xx 最多重试一次。403/404/410/429、WAF/CAPTCHA、
 authwall 与证书错误不重试，也不覆盖旧基线。HTTP 200 但零条目、JS 空壳或挑战页不算成功。
 首次健康读取只称为建立 baseline。
+严格 `--force-all` 扫描若 enabled/observed 为 0 必须失败。后台扫描成功后还要检查
+`sync_visible_master`：若返回 bridge action，完成全部 expected refs 后回填；不能把排队
+写成飞书总库已经同步。
 
 必须区分 `unchanged`、`candidate`、`changed`、`source_issue_pending` 和 `source_issue`。来源失败不能覆盖旧基线，也不能表述为“没有变化”。DeepSeek 仅接收紧凑差分：`ambiguous_review` 只给 advisory，`confirmed_summary` 只改写措辞。
 

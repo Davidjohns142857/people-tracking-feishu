@@ -10,10 +10,12 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qsl, urlparse
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 
 SCHEMA_VERSION = "people-tracking-config-v1"
 VALID_STATES = {"draft", "validated", "enabled"}
+SCAN_CADENCES = {"hourly", "daily", "weekly"}
 MISSING_ANCHOR_POLICIES = {"agent_discovery", "manual_queue"}
 SOURCE_KINDS = {
     "feishu_base",
@@ -259,6 +261,37 @@ def _validate_public_route_url(value: Any, *, name: str) -> str:
     return url
 
 
+def _validate_clock(value: Any, *, name: str) -> str:
+    if not isinstance(value, str) or not re.fullmatch(r"(?:[01]\d|2[0-3]):[0-5]\d", value):
+        raise ConfigError(f"{name} must use 24-hour HH:MM")
+    return value
+
+
+def _validate_schedule(value: Any) -> None:
+    if not isinstance(value, dict):
+        raise ConfigError("schedule must be an object")
+    unknown = sorted(set(value) - {"timezone", "scan", "daily_digest", "weekly_digest"})
+    if unknown:
+        raise ConfigError(f"schedule has unsupported fields: {', '.join(unknown)}")
+    timezone_name = value.get("timezone")
+    if not isinstance(timezone_name, str) or not timezone_name.strip():
+        raise ConfigError("schedule.timezone is required")
+    try:
+        ZoneInfo(timezone_name)
+    except (ZoneInfoNotFoundError, ValueError) as exc:
+        raise ConfigError("schedule.timezone must be a valid IANA timezone") from exc
+    cadence = value.get("scan", "weekly")
+    if cadence not in SCAN_CADENCES:
+        raise ConfigError("schedule.scan must be hourly, daily, or weekly")
+    _validate_clock(value.get("daily_digest", "18:00"), name="schedule.daily_digest")
+    weekly = value.get("weekly_digest", "MON 08:30")
+    if not isinstance(weekly, str):
+        raise ConfigError("schedule.weekly_digest must use DDD HH:MM")
+    match = re.fullmatch(r"(MON|TUE|WED|THU|FRI|SAT|SUN) ((?:[01]\d|2[0-3]):[0-5]\d)", weekly)
+    if not match:
+        raise ConfigError("schedule.weekly_digest must use DDD HH:MM")
+
+
 def _validate_source_routes(payload: Any) -> None:
     if payload is None:
         return
@@ -370,9 +403,12 @@ def validate_config(payload: dict[str, Any], *, require_complete: bool = False) 
         if source["kind"].startswith("feishu_") and not _is_feishu_url(location):
             raise ConfigError(f"sources[{index}] must be an HTTPS Feishu/Lark URL")
         if source["kind"] == "people_intel_api":
-            parsed = urlparse(location)
-            if parsed.scheme != "https" and parsed.hostname not in {"127.0.0.1", "localhost", "::1"}:
-                raise ConfigError("People Intel API must use HTTPS unless it is loopback")
+            api_url = _validate_public_route_url(
+                location,
+                name=f"sources[{index}].url",
+            )
+            if urlparse(api_url).scheme.casefold() != "https":
+                raise ConfigError("People Intel API must use public HTTPS")
     _validate_source_routes(payload.get("source_routes", []))
     mapping = payload.get("field_mapping")
     if not isinstance(mapping, dict):
@@ -387,6 +423,9 @@ def validate_config(payload: dict[str, Any], *, require_complete: bool = False) 
     master = payload.get("master_database")
     if not isinstance(master, dict) or master.get("mode") not in MASTER_MODES:
         raise ConfigError("master_database.mode is invalid")
+    if master.get("mode") == "existing_base":
+        if not _is_feishu_url(str(master.get("url") or "")):
+            raise ConfigError("master_database.url must be an HTTPS Feishu/Lark URL")
     outputs = payload.get("outputs")
     if not isinstance(outputs, dict):
         raise ConfigError("outputs must be an object")
@@ -396,9 +435,7 @@ def validate_config(payload: dict[str, Any], *, require_complete: bool = False) 
             raise ConfigError("outputs.message.target_kind is invalid")
         if message.get("target_kind") in {"chat", "user"} and not message.get("target_id"):
             raise ConfigError("fixed message targets need target_id")
-    schedule = payload.get("schedule")
-    if not isinstance(schedule, dict) or not schedule.get("timezone"):
-        raise ConfigError("schedule.timezone is required")
+    _validate_schedule(payload.get("schedule"))
     apis = payload.get("apis") or {}
     deepseek = apis.get("deepseek") or {"enabled": False}
     if deepseek.get("enabled"):

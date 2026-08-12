@@ -8,6 +8,10 @@ from pathlib import Path
 
 
 def main() -> int:
+    # The verified release directory is immutable input.  Importing the
+    # launcher must not create unmanifested bytecode that makes a later
+    # installer verification fail.
+    os.environ.setdefault("PYTHONDONTWRITEBYTECODE", "1")
     configured = os.environ.get("PEOPLE_TRACKING_FEISHU_CLI")
     candidates = [
         Path(configured).expanduser() if configured else None,

@@ -35,6 +35,21 @@ REQUIRED_LARK_SKILLS = ("lark-shared", "lark-doc", "lark-base", "lark-im")
 SKIP_COPY = {"__pycache__", ".DS_Store"}
 
 
+class InstallFailure(RuntimeError):
+    def __init__(
+        self,
+        message: str,
+        *,
+        mutated: bool,
+        mutations: list[str],
+        rollback_result: dict[str, Any] | None,
+    ):
+        super().__init__(message)
+        self.mutated = mutated
+        self.mutations = mutations
+        self.rollback_result = rollback_result
+
+
 def sha256(path: Path) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as handle:
@@ -320,7 +335,12 @@ def _install_skill(source: Path, destination: Path) -> dict[str, Any]:
         _copy_tree(source, staging / destination.name)
         if backup:
             destination.rename(backup)
-        (staging / destination.name).rename(destination)
+        try:
+            (staging / destination.name).rename(destination)
+        except Exception:
+            if backup and backup.exists() and not destination.exists():
+                backup.rename(destination)
+            raise
     finally:
         shutil.rmtree(staging, ignore_errors=True)
     for script in (destination / "scripts").glob("*.py"):
@@ -328,7 +348,7 @@ def _install_skill(source: Path, destination: Path) -> dict[str, Any]:
     return {"path": str(destination), "changed": True, "backup": str(backup) if backup else None, "hash": source_hash}
 
 
-def apply_install(args: argparse.Namespace, root: Path, home: Path, preview: dict[str, Any]) -> dict[str, Any]:
+def _apply_install_unchecked(args: argparse.Namespace, root: Path, home: Path, preview: dict[str, Any]) -> dict[str, Any]:
     if not preview["ready_to_apply"]:
         raise RuntimeError("dependencies are not ready; no installation changes were made")
     self_test = offline_self_test(
@@ -404,8 +424,12 @@ def apply_install(args: argparse.Namespace, root: Path, home: Path, preview: dic
         previous = previous_skills.get(item["path"])
         if previous and not item.get("changed") and not item.get("backup"):
             item["backup"] = previous.get("backup")
+            item["changed"] = bool(
+                previous.get("changed") or previous.get("backup")
+            )
     launcher.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     launcher_backup = None
+    launcher_changed = False
     launcher_content = (
         "#!/bin/sh\n"
         f"export PYTHONPATH={shlex.quote(str(release / 'runtime'))}\n"
@@ -416,23 +440,32 @@ def apply_install(args: argparse.Namespace, root: Path, home: Path, preview: dic
         if current != launcher_content:
             launcher_backup = _backup_name(launcher)
             launcher.rename(launcher_backup)
+            launcher_changed = True
     if not launcher.exists():
         secure_write(launcher, launcher_content)
         launcher.chmod(0o700)
+        launcher_changed = True
     if launcher_backup is None:
         launcher_backup = (
             Path(previous_state["launcher_backup"])
             if previous_state.get("launcher_backup")
             else None
         )
+        launcher_changed = bool(
+            launcher_changed
+            or previous_state.get("launcher_changed")
+            or launcher_backup
+        )
     install_state = {
         "schema_version": "people-tracking-feishu-install-state-v1",
         "version": VERSION,
         "installed_at": datetime.now(timezone.utc).isoformat(),
+        "status": "installed",
         "release": str(release),
         "venv": str(venv),
         "launcher": str(launcher),
         "launcher_backup": str(launcher_backup) if launcher_backup else None,
+        "launcher_changed": launcher_changed,
         "skills": skills,
         "runtime_mode": preview["runtime_mode"],
         "scheduled_jobs": [],
@@ -460,25 +493,131 @@ def apply_install(args: argparse.Namespace, root: Path, home: Path, preview: dic
     }
 
 
+def _path_snapshot(path: Path) -> dict[str, Any]:
+    return {
+        "exists": path.exists(),
+        "tree_hash": tree_hash(path) if path.is_dir() else None,
+        "sha256": sha256(path) if path.is_file() else None,
+    }
+
+
+def _latest_backup(path: Path) -> Path | None:
+    matches = sorted(path.parent.glob(f"{path.name}.backup-*")) if path.parent.exists() else []
+    return matches[-1] if matches else None
+
+
+def _failed_install_state(
+    preview: dict[str, Any],
+    before: dict[str, dict[str, Any]],
+) -> tuple[dict[str, Any], list[str]]:
+    release = Path(preview["paths"]["release"])
+    venv = Path(preview["paths"]["venv"])
+    launcher = Path(preview["paths"]["launcher"])
+    mutations: list[str] = []
+    skills: list[dict[str, Any]] = []
+    for raw in preview["paths"]["skills"]:
+        target = Path(raw)
+        prior = before[str(target)]
+        current = _path_snapshot(target)
+        changed = current != prior
+        if changed:
+            mutations.append(str(target))
+        backup = _latest_backup(target) if changed and prior["exists"] else None
+        skills.append(
+            {
+                "path": str(target),
+                "changed": changed,
+                "backup": str(backup) if backup else None,
+            }
+        )
+    launcher_changed = _path_snapshot(launcher) != before[str(launcher)]
+    if launcher_changed:
+        mutations.append(str(launcher))
+    for target in (release, venv):
+        if _path_snapshot(target) != before[str(target)]:
+            mutations.append(str(target))
+    return (
+        {
+            "schema_version": "people-tracking-feishu-install-state-v1",
+            "version": VERSION,
+            "installed_at": datetime.now(timezone.utc).isoformat(),
+            "status": "install_failed",
+            "release": str(release),
+            "venv": str(venv),
+            "launcher": str(launcher),
+            "launcher_backup": (
+                str(_latest_backup(launcher)) if before[str(launcher)]["exists"] and _latest_backup(launcher) else None
+            ),
+            "launcher_changed": launcher_changed,
+            "skills": skills,
+            "runtime_mode": preview["runtime_mode"],
+            "scheduled_jobs": [],
+            "external_config_modified": False,
+            "secrets_read": False,
+        },
+        mutations,
+    )
+
+
+def apply_install(args: argparse.Namespace, root: Path, home: Path, preview: dict[str, Any]) -> dict[str, Any]:
+    targets = [
+        Path(preview["paths"]["release"]),
+        Path(preview["paths"]["venv"]),
+        Path(preview["paths"]["launcher"]),
+        *(Path(path) for path in preview["paths"]["skills"]),
+    ]
+    before = {str(path): _path_snapshot(path) for path in targets}
+    try:
+        return _apply_install_unchecked(args, root, home, preview)
+    except Exception as exc:
+        state, mutations = _failed_install_state(preview, before)
+        rollback_result = None
+        if mutations:
+            install_state_path = Path(preview["paths"]["config"]) / "install-state.json"
+            secure_write(
+                install_state_path,
+                json.dumps(state, ensure_ascii=False, indent=2) + "\n",
+            )
+            rollback_result = rollback(home)
+        raise InstallFailure(
+            str(exc),
+            mutated=bool(mutations),
+            mutations=mutations,
+            rollback_result=rollback_result,
+        ) from exc
+
+
 def rollback(home: Path) -> dict[str, Any]:
     path = home / ".config" / "people-tracking-feishu" / "install-state.json"
     if not path.is_file():
         raise RuntimeError("install-state.json is missing")
     state = json.loads(path.read_text(encoding="utf-8"))
+    if state.get("rollback", {}).get("status") == "completed":
+        return {
+            "rolled_back": True,
+            "idempotent_replay": True,
+            "actions": [],
+            "install_state": str(path),
+            "rollback": state["rollback"],
+        }
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     actions = []
     for item in state.get("skills", []):
         target = Path(item["path"])
-        if target.exists() and (item.get("changed") or item.get("backup")):
+        if target.exists() and item.get("changed"):
             recovery = target.with_name(f"{target.name}.rolledback-{stamp}")
             target.rename(recovery)
             actions.append({"moved": str(target), "to": str(recovery)})
-        backup = Path(item["backup"]) if item.get("backup") else None
+        backup = (
+            Path(item["backup"])
+            if item.get("changed") and item.get("backup")
+            else None
+        )
         if backup and backup.exists() and not target.exists():
             backup.rename(target)
             actions.append({"restored": str(target), "from": str(backup)})
     launcher = Path(state["launcher"])
-    if launcher.exists():
+    if launcher.exists() and state.get("launcher_changed", True):
         recovery = launcher.with_name(f"{launcher.name}.rolledback-{stamp}")
         launcher.rename(recovery)
         actions.append({"moved": str(launcher), "to": str(recovery)})
@@ -486,9 +625,20 @@ def rollback(home: Path) -> dict[str, Any]:
     if backup and backup.exists() and not launcher.exists():
         backup.rename(launcher)
         actions.append({"restored": str(launcher), "from": str(backup)})
+    rollback_record = {
+        "status": "completed",
+        "completed_at": datetime.now(timezone.utc).isoformat(),
+        "actions": actions,
+    }
+    state["status"] = "rolled_back"
+    state["rollback"] = rollback_record
+    secure_write(path, json.dumps(state, ensure_ascii=False, indent=2) + "\n")
     return {
         "rolled_back": True,
+        "idempotent_replay": False,
         "actions": actions,
+        "install_state": str(path),
+        "rollback": rollback_record,
         "preserved": [state.get("release"), state.get("venv"), str(path.parent), str(home / ".local/state/people-tracking-feishu")],
         "deleted": [],
         "scheduled_jobs_note": "Schedules are registered only after onboarding confirmation and require their own explicit removal.",
@@ -532,9 +682,16 @@ def main() -> int:
         print(json.dumps(payload, ensure_ascii=False, indent=2))
         return 0
     except (OSError, RuntimeError, ValueError, json.JSONDecodeError, subprocess.SubprocessError) as exc:
+        mutated = bool(getattr(exc, "mutated", False))
         print(
             json.dumps(
-                {"ok": False, "error": {"type": type(exc).__name__, "message": str(exc)}, "mutated": False},
+                {
+                    "ok": False,
+                    "error": {"type": type(exc).__name__, "message": str(exc)},
+                    "mutated": mutated,
+                    "mutations": list(getattr(exc, "mutations", [])),
+                    "rollback": getattr(exc, "rollback_result", None),
+                },
                 ensure_ascii=False,
                 indent=2,
             ),

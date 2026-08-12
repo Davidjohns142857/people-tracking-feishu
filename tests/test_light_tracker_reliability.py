@@ -72,6 +72,125 @@ def test_identical_candidate_is_confirmed_on_second_healthy_observation(tmp_path
     tracker.close()
 
 
+def test_candidate_confirmation_counts_distinct_runs_only(tmp_path):
+    tracker, source = make_tracker(tmp_path)
+    observe(tracker, source, BASE)
+    run_id = tracker.start_run("production-rescan")
+    first = tracker.observe(
+        run_id,
+        source["source_id"],
+        FetchObservation(body=ADDED, final_url=source["url"]),
+    )
+    repeated = tracker.observe(
+        run_id,
+        source["source_id"],
+        FetchObservation(body=ADDED, final_url=source["url"]),
+    )
+    tracker.complete_run(run_id)
+
+    state = tracker.db.execute(
+        "SELECT candidate_count,candidate_last_run_id FROM sources WHERE source_id=?",
+        (source["source_id"],),
+    ).fetchone()
+    assert first.status == repeated.status == "candidate"
+    assert first.confirmation_count == repeated.confirmation_count == 1
+    assert state["candidate_count"] == 1
+    assert state["candidate_last_run_id"] == run_id
+
+    _, confirmed = observe(tracker, source, ADDED)
+    assert confirmed.status == "changed"
+    tracker.close()
+
+
+def test_acceptance_run_never_advances_baseline_or_candidate(tmp_path):
+    tracker, source = make_tracker(tmp_path)
+    observe(tracker, source, BASE)
+    _, first = observe(tracker, source, ADDED)
+    before = tracker.db.execute(
+        """SELECT snapshot_json,semantic_hash,candidate_snapshot_json,
+                  candidate_hash,candidate_count,candidate_last_run_id
+           FROM sources WHERE source_id=?""",
+        (source["source_id"],),
+    ).fetchone()
+
+    run_id = tracker.start_run("homepage-acceptance", purpose="acceptance")
+    decision = tracker.observe(
+        run_id,
+        source["source_id"],
+        FetchObservation(body=ADDED, final_url=source["url"]),
+    )
+    tracker.complete_run(run_id)
+    after = tracker.db.execute(
+        """SELECT snapshot_json,semantic_hash,candidate_snapshot_json,
+                  candidate_hash,candidate_count,candidate_last_run_id
+           FROM sources WHERE source_id=?""",
+        (source["source_id"],),
+    ).fetchone()
+
+    assert first.status == "candidate"
+    assert decision.status == "candidate"
+    assert "未推进正式候选或基线" in decision.summary
+    assert tuple(after) == tuple(before)
+    tracker.close()
+
+
+def test_validation_run_cannot_create_first_baseline(tmp_path):
+    tracker, source = make_tracker(tmp_path)
+    run_id = tracker.start_run("route-validation")
+    decision = tracker.observe(
+        run_id,
+        source["source_id"],
+        FetchObservation(body=BASE, final_url=source["url"]),
+    )
+    tracker.complete_run(run_id)
+    state = tracker.db.execute(
+        "SELECT snapshot_json,candidate_snapshot_json FROM sources WHERE source_id=?",
+        (source["source_id"],),
+    ).fetchone()
+    assert decision.status == "baseline"
+    assert state["snapshot_json"] is None
+    assert state["candidate_snapshot_json"] is None
+    tracker.close()
+
+
+def test_configure_linkedin_weekly_reads_enabled_state(tmp_path):
+    tracker, source = make_tracker(
+        tmp_path,
+        url="https://www.linkedin.com/in/alice-zhang",
+    )
+    state = tracker.configure_linkedin_weekly(source["source_id"], cadence_days=5)
+    assert state["cadence_days"] == 5
+    tracker.db.execute(
+        "UPDATE sources SET tracking_enabled=0 WHERE source_id=?",
+        (source["source_id"],),
+    )
+    tracker.db.commit()
+    try:
+        tracker.configure_linkedin_weekly(source["source_id"])
+    except ValueError as exc:
+        assert "disabled" in str(exc)
+    else:
+        raise AssertionError("disabled source must be rejected")
+    tracker.close()
+
+
+def test_report_names_candidates_repeated_three_times(tmp_path):
+    tracker, source = make_tracker(tmp_path)
+    observe(tracker, source, BASE)
+    run_id, decision = observe(tracker, source, ADDED)
+    assert decision.status == "candidate"
+    tracker.db.execute(
+        "UPDATE sources SET candidate_count=3 WHERE source_id=?",
+        (source["source_id"],),
+    )
+    tracker.db.commit()
+    report = tracker.render_report(run_id)
+    assert "长期待审候选" in report
+    assert "Alice Zhang · homepage" in report
+    assert "已重复 3 次" in report
+    tracker.close()
+
+
 def test_304_can_confirm_same_candidate_representation(tmp_path):
     tracker, source = make_tracker(tmp_path)
     observe(tracker, source, BASE, etag='"v1"')

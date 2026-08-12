@@ -10,6 +10,7 @@ permissions:
 jobs:
   release:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -19,12 +20,12 @@ jobs:
         run: test "${GITHUB_REF_NAME}" = "v$(cat VERSION)"
       - name: Install offline test dependencies
         run: |
-          python -m pip install pytest
+          python -m pip install pytest==9.1.1
           python -m pip install --no-index vendor/wheels/pypinyin-0.55.0-py2.py3-none-any.whl
       - name: Validate, test, build and verify
         run: |
           python scripts/validate_portable_skill.py
-          python -m pytest -q tests
+          python -m pytest -q -p no:cacheprovider tests
           python scripts/build_feishu_release.py --output-dir dist
           python scripts/build_feishu_release.py --output-dir dist-second
           version="$(cat VERSION)"

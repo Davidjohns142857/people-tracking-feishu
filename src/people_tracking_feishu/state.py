@@ -148,7 +148,9 @@ class PortableState:
                     name,
                     aliases=list(record.get("aliases") or []),
                     urls=urls,
-                    profile=dict(record.get("profile") or {}),
+                    # Human-visible fields are reconciled below so an incoming
+                    # source can never overwrite a non-empty curated value.
+                    profile={},
                     secondary_id=secondary,
                 )
             except ValueError as exc:
@@ -511,14 +513,24 @@ class PortableState:
             current = profile.get(field)
             if current not in (None, "", []) and current != incoming:
                 self._conflict(person_key, field, current, incoming, source_ref)
+                continue
             profile[field] = incoming
+        chosen_name = row["canonical_name"]
+        if canonical and normalize_key(canonical) != normalize_key(row["canonical_name"]):
+            self._conflict(
+                person_key,
+                "canonical_name",
+                row["canonical_name"],
+                canonical,
+                source_ref,
+            )
         try:
             self.db.execute(
                 """UPDATE people SET canonical_name=?,normalized_name=?,aliases_json=?,
                        profile_json=?,updated_at=? WHERE person_key=?""",
                 (
-                    canonical or row["canonical_name"],
-                    normalize_key(canonical or row["canonical_name"]),
+                    chosen_name,
+                    normalize_key(chosen_name),
                     json.dumps(aliases, ensure_ascii=False),
                     json.dumps(profile, ensure_ascii=False),
                     utc_now(),
@@ -526,7 +538,7 @@ class PortableState:
                 ),
             )
         except sqlite3.IntegrityError:
-            self._conflict(person_key, "canonical_name", row["canonical_name"], canonical, source_ref)
+            self._conflict(person_key, "canonical_name", row["canonical_name"], chosen_name, source_ref)
 
     def _issue(
         self,

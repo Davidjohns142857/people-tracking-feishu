@@ -72,6 +72,11 @@ def verify(root: Path) -> dict[str, Any]:
     scan: dict[str, list[str]] = {"secrets": [], "local_paths": [], "forbidden": [], "symlinks": []}
     for path in sorted(root.rglob("*")):
         relative = path.relative_to(root).as_posix()
+        # Python may have imported a release module before verification.  Its
+        # bytecode cache is derived and excluded by the installer, so it is
+        # omitted from the manifest comparison and content scan.
+        if "__pycache__" in path.parts or path.suffix.casefold() in {".pyc", ".pyo"}:
+            continue
         if path.is_symlink():
             scan["symlinks"].append(relative)
             continue

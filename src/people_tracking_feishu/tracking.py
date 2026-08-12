@@ -225,6 +225,7 @@ def _scan_validation(
     sources_attempted: int,
     full_fetch_planned: int,
     full_fetch_attempted: int,
+    observation_errors: int = 0,
 ) -> dict[str, Any]:
     if not 0.0 <= max_error_rate <= 1.0:
         raise ValueError("max_error_rate must be between 0 and 1")
@@ -234,8 +235,15 @@ def _scan_validation(
         if item.get("health_status") != "healthy"
         or item.get("decision") in _ERROR_DECISIONS
     ]
-    error_rate = len(errors) / len(outcomes) if outcomes else 0.0
+    error_count = len(errors) + observation_errors
+    error_rate = error_count / sources_attempted if sources_attempted else 0.0
     reasons: list[str] = []
+    if observation_errors:
+        reasons.append(
+            f"{observation_errors} source observation(s) raised internal exceptions"
+        )
+    if force_all and sources_enabled == 0:
+        reasons.append("strict full scan has zero enabled sources")
     if error_rate > max_error_rate:
         reasons.append(
             f"source error rate {error_rate:.2%} exceeds the "
@@ -262,7 +270,7 @@ def _scan_validation(
     return {
         "passed": passed,
         "max_error_rate": max_error_rate,
-        "error_sources": len(errors),
+        "error_sources": error_count,
         "observed_sources": len(outcomes),
         "error_rate": round(error_rate, 6),
         "coverage": {
@@ -332,6 +340,7 @@ def scan_due(
         force_full_fetch=force_full_fetch,
     )
     outcomes: list[dict[str, Any]] = []
+    observation_errors: list[dict[str, Any]] = []
     sources_attempted = 0
     full_fetch_attempted = 0
     homepage_planned = sum(source.get("kind") == "homepage" for source in sources)
@@ -346,24 +355,49 @@ def scan_due(
             if source.get("kind") == "homepage":
                 homepage_attempted += 1
             fetch_started = perf_counter()
-            observation, retries, waited = _fetch_with_policy(
-                source,
-                homepage_retries=retry_limit,
-                homepage_backoff_seconds=retry_backoff,
-            )
-            timing["fetch_seconds"] = timing.get("fetch_seconds", 0.0) + (
-                perf_counter() - fetch_started
-            )
-            homepage_retries += retries
-            homepage_retry_wait_seconds += waited
-            decision = state.tracker.observe(
-                tracker_run,
-                source["source_id"],
-                observation,
-                reviewer=reviewer,
-                timing_sink=timing,
-                ai_usage_sink=opportunities,
-            )
+            try:
+                observation, retries, waited = _fetch_with_policy(
+                    source,
+                    homepage_retries=retry_limit,
+                    homepage_backoff_seconds=retry_backoff,
+                )
+                homepage_retries += retries
+                homepage_retry_wait_seconds += waited
+            except Exception as exc:
+                observation_errors.append(
+                    {
+                        "source_id": source["source_id"],
+                        "kind": source.get("kind"),
+                        "phase": "fetch",
+                        "error_type": type(exc).__name__,
+                        "message": str(exc)[:800],
+                    }
+                )
+                continue
+            finally:
+                timing["fetch_seconds"] = timing.get("fetch_seconds", 0.0) + (
+                    perf_counter() - fetch_started
+                )
+            try:
+                decision = state.tracker.observe(
+                    tracker_run,
+                    source["source_id"],
+                    observation,
+                    reviewer=reviewer,
+                    timing_sink=timing,
+                    ai_usage_sink=opportunities,
+                )
+            except Exception as exc:
+                observation_errors.append(
+                    {
+                        "source_id": source["source_id"],
+                        "kind": source.get("kind"),
+                        "phase": "observe",
+                        "error_type": type(exc).__name__,
+                        "message": str(exc)[:800],
+                    }
+                )
+                continue
             outcomes.append(
                 {
                     "source_id": source["source_id"],
@@ -374,7 +408,7 @@ def scan_due(
                     "summary": decision.summary,
                 }
             )
-        state.tracker.complete_run(tracker_run)
+        tracker_run_status = "partial" if observation_errors else "completed"
         usage_after = reviewer.usage_snapshot() if reviewer else {}
         usage = {
             key: max(0, int(usage_after.get(key, 0)) - int(usage_before.get(key, 0)))
@@ -389,9 +423,12 @@ def scan_due(
             sources_attempted=sources_attempted,
             full_fetch_planned=full_fetch_planned,
             full_fetch_attempted=full_fetch_attempted,
+            observation_errors=len(observation_errors),
         )
         metrics = {
             "tracker_run_id": tracker_run,
+            "tracker_run_status": tracker_run_status,
+            "observation_errors": observation_errors,
             "sources_due": len(sources),
             "sources_enabled": len(enabled_sources),
             "sources_planned": len(sources),
@@ -421,12 +458,17 @@ def scan_due(
                 "usage_this_run": usage,
             },
         }
+        state.tracker.complete_run(
+            tracker_run,
+            observation_errors=observation_errors,
+        )
         if validation["passed"]:
             state.set_meta("last_tracker_run_id", tracker_run)
         state.complete_run(runtime_run, metrics)
         return {
             "run_id": runtime_run,
             "tracker_run_id": tracker_run,
+            "tracker_run_status": tracker_run_status,
             "metrics": metrics,
             "validation": validation,
             "reasons": validation["reasons"],
@@ -438,6 +480,11 @@ def scan_due(
             "outcomes": outcomes,
         }
     except Exception as exc:
+        state.tracker.fail_run(
+            tracker_run,
+            exc,
+            observation_errors=observation_errors,
+        )
         state.complete_run(
             runtime_run,
             {"tracker_run_id": tracker_run, "error_type": type(exc).__name__},

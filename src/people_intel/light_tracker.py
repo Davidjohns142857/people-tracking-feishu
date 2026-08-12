@@ -273,7 +273,34 @@ def canonical_url(value: str) -> str:
     if path != "/":
         path = path.rstrip("/")
     query = urllib.parse.parse_qsl(parsed.query, keep_blank_values=True)
-    keep = [(k, v) for k, v in query if k in {"user", "id"}]
+    if (
+        re.fullmatch(r"scholar\.google\.[a-z.]+", host_without_www)
+        or host_without_www in {"github.com", "huggingface.co"}
+        or host_without_www.endswith("linkedin.com")
+    ):
+        # Preserve the historical stable-identity contract for fixed platform
+        # namespaces.  This branch intentionally remains byte-for-byte
+        # equivalent to the earlier canonicalizer.
+        keep = [(k, v) for k, v in query if k in {"user", "id"}]
+    else:
+        # Arbitrary Homepages often use functional query parameters (language,
+        # tenant, profile ID, view, etc.).  Preserve those and remove only
+        # well-known advertising/analytics parameters; dropping every key except
+        # ``id`` previously changed the registered resource itself.
+        tracking_names = {
+            "dclid", "fbclid", "gclid", "gbraid", "msclkid", "ttclid",
+            "twclid", "wbraid", "yclid", "mc_cid", "mc_eid",
+            # Common malformed export of ``utm_source`` observed in source
+            # dossiers after punctuation/underscore stripping.
+            "utmsource", "utmmedium", "utmcampaign", "utmcontent", "utmterm",
+            "utmid",
+        }
+        keep = [
+            (k, v)
+            for k, v in query
+            if not k.casefold().startswith("utm_")
+            and k.casefold() not in tracking_names
+        ]
     return urllib.parse.urlunsplit((scheme, host, path, urllib.parse.urlencode(keep), ""))
 
 
@@ -1728,6 +1755,7 @@ class LightTracker:
         self._ensure_column("sources", "candidate_count", "INTEGER NOT NULL DEFAULT 0")
         self._ensure_column("sources", "candidate_first_seen_at", "TEXT")
         self._ensure_column("sources", "candidate_decision_json", "TEXT")
+        self._ensure_column("sources", "candidate_last_run_id", "TEXT")
         self._ensure_column("sources", "quality_json", "TEXT")
         self._ensure_column("sources", "etag", "TEXT")
         self._ensure_column("sources", "last_modified", "TEXT")
@@ -1751,6 +1779,9 @@ class LightTracker:
         self._ensure_column("observations", "confirmation_count", "INTEGER NOT NULL DEFAULT 0")
         self._ensure_column("observations", "confirmations_required", "INTEGER NOT NULL DEFAULT 0")
         self._ensure_column("observations", "extractor_version", "TEXT")
+        self._ensure_column("runs", "purpose", "TEXT NOT NULL DEFAULT 'production'")
+        self._ensure_column("runs", "error_json", "TEXT")
+        self._ensure_column("runs", "observation_errors", "INTEGER NOT NULL DEFAULT 0")
         self.db.commit()
 
     def _ensure_column(self, table: str, name: str, definition: str) -> None:
@@ -1889,7 +1920,7 @@ class LightTracker:
         if cadence_days < 1:
             raise ValueError("cadence_days must be at least 1")
         source = self.db.execute(
-            "SELECT kind FROM sources WHERE source_id=?", (source_id,)
+            "SELECT kind,tracking_enabled FROM sources WHERE source_id=?", (source_id,)
         ).fetchone()
         if not source:
             raise KeyError(source_id)
@@ -1998,9 +2029,29 @@ class LightTracker:
         self.db.commit()
         return self.person(person_key)
 
-    def start_run(self, trigger: str = "manual") -> str:
+    def start_run(
+        self,
+        trigger: str = "manual",
+        *,
+        purpose: Literal["production", "acceptance", "validation"] | None = None,
+    ) -> str:
+        if purpose is None:
+            normalized_trigger = normalize_key(trigger)
+            purpose = (
+                "acceptance"
+                if "acceptance" in normalized_trigger
+                else "validation"
+                if "validation" in normalized_trigger
+                else "production"
+            )
+        if purpose not in {"production", "acceptance", "validation"}:
+            raise ValueError("unsupported run purpose")
         run_id = f"run_{_sha(f'{utc_now()}|{trigger}', 20)}"
-        self.db.execute("INSERT INTO runs VALUES(?,?,?,?,?)", (run_id, utc_now(), None, trigger, "running"))
+        self.db.execute(
+            """INSERT INTO runs(run_id,started_at,completed_at,trigger,status,purpose)
+               VALUES(?,?,?,?,?,?)""",
+            (run_id, utc_now(), None, trigger, "running", purpose),
+        )
         self.db.commit()
         return run_id
 
@@ -2080,6 +2131,14 @@ class LightTracker:
         ).fetchone()
         if not source:
             raise KeyError(source_id)
+        run = self.db.execute(
+            "SELECT status,purpose FROM runs WHERE run_id=?", (run_id,)
+        ).fetchone()
+        if not run:
+            raise KeyError(run_id)
+        if run["status"] != "running":
+            raise ValueError(f"run is not writable: {run_id} ({run['status']})")
+        authoritative_run = run["purpose"] == "production"
         old = FeatureSnapshot.from_json(source["snapshot_json"]) if source["snapshot_json"] else None
         record_timing("source_state_load", state_started)
         health_started = perf_counter()
@@ -2126,11 +2185,28 @@ class LightTracker:
                     )
                 ]
 
-                if decision.status in {"unchanged", "noise"}:
+                if not authoritative_run:
+                    if decision.status in {"changed", "ambiguous"}:
+                        decision.status = "candidate"
+                        decision.confirmation_count = int(source["candidate_count"] or 0)
+                        decision.confirmations_required = int(
+                            stored_decision.confirmations_required or 0
+                        )
+                    decision.summary += (
+                        f"；{run['purpose']} 运行只验收读取结果，未推进正式候选或基线"
+                    )
+                    self.db.execute(
+                        """UPDATE sources SET health_status='healthy',
+                           health_detail='validation not modified',
+                           consecutive_failures=0,last_checked_at=? WHERE source_id=?""",
+                        (observation.observed_at, source_id),
+                    )
+                elif decision.status in {"unchanged", "noise"}:
                     self.db.execute(
                         """UPDATE sources SET candidate_snapshot_json=NULL,
                            candidate_hash=NULL,candidate_count=0,
                            candidate_first_seen_at=NULL,candidate_decision_json=NULL,
+                           candidate_last_run_id=NULL,
                            health_status='healthy',health_detail='not modified',
                            consecutive_failures=0,last_checked_at=?,
                            etag=COALESCE(?,etag),last_modified=COALESCE(?,last_modified)
@@ -2143,7 +2219,9 @@ class LightTracker:
                         ),
                     )
                 elif decision.status == "changed":
-                    count = source["candidate_count"] + 1
+                    count = int(source["candidate_count"] or 0)
+                    if source["candidate_last_run_id"] != run_id:
+                        count += 1
                     required = confirmations_required(
                         decision,
                         source["kind"],
@@ -2169,7 +2247,8 @@ class LightTracker:
                         self.db.execute(
                             """UPDATE sources SET snapshot_json=?,semantic_hash=?,candidate_snapshot_json=NULL,
                                candidate_hash=NULL,candidate_count=0,candidate_first_seen_at=NULL,
-                               candidate_decision_json=NULL,health_status='healthy',health_detail='not modified',
+                               candidate_decision_json=NULL,candidate_last_run_id=NULL,
+                               health_status='healthy',health_detail='not modified',
                                consecutive_failures=0,last_checked_at=?,last_changed_at=?,
                                etag=COALESCE(?,etag),last_modified=COALESCE(?,last_modified)
                                WHERE source_id=?""",
@@ -2186,17 +2265,20 @@ class LightTracker:
                         )
                         self.db.execute(
                             """UPDATE sources SET candidate_count=?,candidate_decision_json=?,
+                               candidate_last_run_id=?,
                                health_status='healthy',health_detail='not modified',consecutive_failures=0,
                                last_checked_at=?,etag=COALESCE(?,etag),last_modified=COALESCE(?,last_modified)
                                WHERE source_id=?""",
                             (
-                                count, json.dumps(asdict(decision), ensure_ascii=False),
+                                count, json.dumps(asdict(decision), ensure_ascii=False), run_id,
                                 observation.observed_at, observation.etag,
                                 observation.last_modified, source_id,
                             ),
                         )
                 else:
-                    count = source["candidate_count"] + 1
+                    count = int(source["candidate_count"] or 0)
+                    if source["candidate_last_run_id"] != run_id:
+                        count += 1
                     decision.status = "candidate"
                     decision.confirmation_count = count
                     decision.confirmations_required = 0
@@ -2205,23 +2287,35 @@ class LightTracker:
                     )
                     self.db.execute(
                         """UPDATE sources SET candidate_count=?,candidate_decision_json=?,
+                           candidate_last_run_id=?,
                            health_status='healthy',health_detail='not modified',consecutive_failures=0,
                            last_checked_at=?,etag=COALESCE(?,etag),last_modified=COALESCE(?,last_modified)
                            WHERE source_id=?""",
                         (
-                            count, json.dumps(asdict(decision), ensure_ascii=False),
+                            count, json.dumps(asdict(decision), ensure_ascii=False), run_id,
                             observation.observed_at, observation.etag,
                             observation.last_modified, source_id,
                         ),
                     )
             else:
                 decision = ChangeDecision("unchanged", 0.0, "条件请求返回 304，页面表示未变化")
-                self.db.execute(
-                    """UPDATE sources SET health_status='healthy',health_detail='not modified',
-                       consecutive_failures=0,last_checked_at=?,etag=COALESCE(?,etag),
-                       last_modified=COALESCE(?,last_modified) WHERE source_id=?""",
-                    (observation.observed_at, observation.etag, observation.last_modified, source_id),
-                )
+                if not authoritative_run:
+                    decision.summary += (
+                        f"；{run['purpose']} 运行只验收读取结果，未推进正式候选或基线"
+                    )
+                    self.db.execute(
+                        """UPDATE sources SET health_status='healthy',
+                           health_detail='validation not modified',
+                           consecutive_failures=0,last_checked_at=? WHERE source_id=?""",
+                        (observation.observed_at, source_id),
+                    )
+                else:
+                    self.db.execute(
+                        """UPDATE sources SET health_status='healthy',health_detail='not modified',
+                           consecutive_failures=0,last_checked_at=?,etag=COALESCE(?,etag),
+                           last_modified=COALESCE(?,last_modified) WHERE source_id=?""",
+                        (observation.observed_at, observation.etag, observation.last_modified, source_id),
+                    )
             record_timing(
                 "conditional_confirmation_and_state_transition",
                 transition_started,
@@ -2438,8 +2532,19 @@ class LightTracker:
                 candidate_count = source["candidate_count"]
                 candidate_first_seen = source["candidate_first_seen_at"]
                 candidate_decision_json: str | None = source["candidate_decision_json"]
+                candidate_last_run_id: str | None = source["candidate_last_run_id"]
 
-                if decision.status == "baseline":
+                if not authoritative_run:
+                    # Acceptance and validation runs prove that a route can be
+                    # read, but they are not independent production evidence.
+                    # Preserve every baseline/candidate field byte-for-byte.
+                    if decision.status in {"changed", "ambiguous"}:
+                        decision.status = "candidate"
+                    decision.confirmation_count = int(candidate_count or 0)
+                    decision.summary += (
+                        f"；{run['purpose']} 运行只验收读取结果，未推进正式候选或基线"
+                    )
+                elif decision.status == "baseline":
                     accepted_snapshot = snapshot
                     clear_candidate = True
                 elif decision.status == "unchanged":
@@ -2454,7 +2559,12 @@ class LightTracker:
                 elif decision.status == "changed":
                     required = confirmations_required(decision, source["kind"], snapshot)
                     candidate_representation = snapshot.comparison_hash or snapshot.semantic_hash
-                    count = candidate_count + 1 if candidate_hash == candidate_representation else 1
+                    if candidate_hash != candidate_representation:
+                        count = 1
+                    elif candidate_last_run_id == run_id:
+                        count = int(candidate_count or 0)
+                    else:
+                        count = int(candidate_count or 0) + 1
                     decision.confirmation_count = count
                     decision.confirmations_required = required
                     if count >= required:
@@ -2475,6 +2585,7 @@ class LightTracker:
                         candidate_snapshot_json = snapshot.to_json()
                         candidate_hash = candidate_representation
                         candidate_count = count
+                        candidate_last_run_id = run_id
                         candidate_first_seen = (
                             source["candidate_first_seen_at"]
                             if source["candidate_hash"] == candidate_representation
@@ -2483,7 +2594,12 @@ class LightTracker:
                         candidate_decision_json = json.dumps(asdict(decision), ensure_ascii=False)
                 else:
                     candidate_representation = snapshot.comparison_hash or snapshot.semantic_hash
-                    count = candidate_count + 1 if candidate_hash == candidate_representation else 1
+                    if candidate_hash != candidate_representation:
+                        count = 1
+                    elif candidate_last_run_id == run_id:
+                        count = int(candidate_count or 0)
+                    else:
+                        count = int(candidate_count or 0) + 1
                     decision.status = "candidate"
                     decision.confirmation_count = count
                     decision.confirmations_required = 0
@@ -2491,6 +2607,7 @@ class LightTracker:
                     candidate_snapshot_json = snapshot.to_json()
                     candidate_hash = candidate_representation
                     candidate_count = count
+                    candidate_last_run_id = run_id
                     candidate_first_seen = (
                         source["candidate_first_seen_at"]
                         if source["candidate_hash"] == candidate_representation
@@ -2500,41 +2617,68 @@ class LightTracker:
 
                 if clear_candidate:
                     candidate_snapshot_json = candidate_hash = candidate_first_seen = candidate_decision_json = None
+                    candidate_last_run_id = None
                     candidate_count = 0
-                assert accepted_snapshot is not None
-                self.db.execute(
-                    """UPDATE sources SET snapshot_json=?,semantic_hash=?,
-                       candidate_snapshot_json=?,candidate_hash=?,candidate_count=?,
-                       candidate_first_seen_at=?,candidate_decision_json=?,
-                       health_status='healthy',health_detail='ok',consecutive_failures=0,
-                       last_checked_at=?,last_changed_at=?,quality_json=?,
-                       etag=COALESCE(?,etag),last_modified=COALESCE(?,last_modified),
-                       binding_status=?,binding_confidence=?,binding_reason=?,
-                       binding_evidence_json=?,binding_verified_at=?,
-                       last_full_fetch_at=?
-                       WHERE source_id=?""",
-                    (
-                        accepted_snapshot.to_json(), accepted_snapshot.semantic_hash,
-                        candidate_snapshot_json, candidate_hash, candidate_count,
-                        candidate_first_seen, candidate_decision_json,
-                        observation.observed_at, changed_at,
-                        json.dumps(quality_payload, ensure_ascii=False),
-                        observation.etag,
-                        observation.last_modified,
-                        identity_result.status,
-                        identity_result.confidence,
-                        "；".join(identity_result.reasons),
-                        json.dumps(identity_result.evidence, ensure_ascii=False),
+                if authoritative_run:
+                    assert accepted_snapshot is not None
+                    self.db.execute(
+                        """UPDATE sources SET snapshot_json=?,semantic_hash=?,
+                           candidate_snapshot_json=?,candidate_hash=?,candidate_count=?,
+                           candidate_first_seen_at=?,candidate_decision_json=?,
+                           candidate_last_run_id=?,
+                           health_status='healthy',health_detail='ok',consecutive_failures=0,
+                           last_checked_at=?,last_changed_at=?,quality_json=?,
+                           etag=COALESCE(?,etag),last_modified=COALESCE(?,last_modified),
+                           binding_status=?,binding_confidence=?,binding_reason=?,
+                           binding_evidence_json=?,binding_verified_at=?,
+                           last_full_fetch_at=?
+                           WHERE source_id=?""",
                         (
-                            observation.observed_at
-                            if identity_result.status == "verified"
-                            else None
+                            accepted_snapshot.to_json(), accepted_snapshot.semantic_hash,
+                            candidate_snapshot_json, candidate_hash, candidate_count,
+                            candidate_first_seen, candidate_decision_json,
+                            candidate_last_run_id,
+                            observation.observed_at, changed_at,
+                            json.dumps(quality_payload, ensure_ascii=False),
+                            observation.etag,
+                            observation.last_modified,
+                            identity_result.status,
+                            identity_result.confidence,
+                            "；".join(identity_result.reasons),
+                            json.dumps(identity_result.evidence, ensure_ascii=False),
+                            (
+                                observation.observed_at
+                                if identity_result.status == "verified"
+                                else None
+                            ),
+                            observation.observed_at,
+                            source_id,
                         ),
-                        observation.observed_at,
-                        source_id,
-                    ),
-                )
-                semantic_hash = snapshot.semantic_hash
+                    )
+                    semantic_hash = snapshot.semantic_hash
+                else:
+                    semantic_hash = source["semantic_hash"]
+                    self.db.execute(
+                        """UPDATE sources SET health_status='healthy',
+                           health_detail='validation ok',consecutive_failures=0,
+                           last_checked_at=?,quality_json=?,binding_status=?,
+                           binding_confidence=?,binding_reason=?,binding_evidence_json=?,
+                           binding_verified_at=? WHERE source_id=?""",
+                        (
+                            observation.observed_at,
+                            json.dumps(quality_payload, ensure_ascii=False),
+                            identity_result.status,
+                            identity_result.confidence,
+                            "；".join(identity_result.reasons),
+                            json.dumps(identity_result.evidence, ensure_ascii=False),
+                            (
+                                observation.observed_at
+                                if identity_result.status == "verified"
+                                else None
+                            ),
+                            source_id,
+                        ),
+                    )
                 record_timing(
                     "confirmation_and_baseline_transition",
                     transition_started,
@@ -2589,8 +2733,45 @@ class LightTracker:
         record_timing("observe_total", observe_started)
         return decision
 
-    def complete_run(self, run_id: str) -> None:
-        self.db.execute("UPDATE runs SET completed_at=?,status='completed' WHERE run_id=?", (utc_now(), run_id))
+    def complete_run(
+        self,
+        run_id: str,
+        *,
+        observation_errors: list[dict[str, Any]] | None = None,
+    ) -> None:
+        errors = observation_errors or []
+        status = "partial" if errors else "completed"
+        self.db.execute(
+            """UPDATE runs SET completed_at=?,status=?,observation_errors=?,error_json=?
+               WHERE run_id=? AND status='running'""",
+            (
+                utc_now(),
+                status,
+                len(errors),
+                json.dumps(errors, ensure_ascii=False) if errors else None,
+                run_id,
+            ),
+        )
+        self.db.commit()
+
+    def fail_run(
+        self,
+        run_id: str,
+        error: BaseException | str,
+        *,
+        observation_errors: list[dict[str, Any]] | None = None,
+    ) -> None:
+        errors = observation_errors or []
+        failure = {
+            "type": type(error).__name__ if isinstance(error, BaseException) else "Error",
+            "message": normalize_text(str(error))[:800],
+            "observation_errors": errors,
+        }
+        self.db.execute(
+            """UPDATE runs SET completed_at=?,status='failed',observation_errors=?,
+               error_json=? WHERE run_id=? AND status='running'""",
+            (utc_now(), len(errors), json.dumps(failure, ensure_ascii=False), run_id),
+        )
         self.db.commit()
 
     def render_report(self, run_id: str) -> str:
@@ -2614,6 +2795,33 @@ class LightTracker:
                 (run_id,),
             )
         }
+        aged_candidates = []
+        now = datetime.now(timezone.utc)
+        for row in self.db.execute(
+            """SELECT s.source_id,s.kind,s.url,s.candidate_count,
+                      s.candidate_first_seen_at,s.candidate_decision_json,
+                      p.canonical_name
+               FROM sources s JOIN people p ON p.person_key=s.person_key
+               WHERE s.candidate_snapshot_json IS NOT NULL
+               ORDER BY s.candidate_first_seen_at,p.canonical_name"""
+        ):
+            first_seen = row["candidate_first_seen_at"]
+            try:
+                first_seen_at = datetime.fromisoformat(
+                    str(first_seen).replace("Z", "+00:00")
+                )
+                if first_seen_at.tzinfo is None:
+                    first_seen_at = first_seen_at.replace(tzinfo=timezone.utc)
+                age_days = max(0, (now - first_seen_at).days)
+            except (TypeError, ValueError):
+                age_days = 0
+            if int(row["candidate_count"] or 0) < 3 and age_days < 7:
+                continue
+            try:
+                candidate_detail = json.loads(row["candidate_decision_json"] or "{}")
+            except (TypeError, json.JSONDecodeError):
+                candidate_detail = {}
+            aged_candidates.append((row, age_days, candidate_detail))
         lines = [
             "# 人才跟踪更新",
             "",
@@ -2624,7 +2832,6 @@ class LightTracker:
         ]
         if not rows:
             lines.extend(["本轮没有发现已确认、需要汇报的新进展或持续来源异常。", ""])
-            return "\n".join(lines)
         current: str | None = None
         for row in rows:
             if row["person_key"] != current:
@@ -2646,6 +2853,16 @@ class LightTracker:
             for item in delta["removals"][:5]:
                 lines.append(f"- 页面不再显示：{item['text']}（仅记录页面变化，不自动推断离职或撤回）")
             lines.extend([f"- 来源：[{row['url']}]({row['url']})", ""])
+        if aged_candidates:
+            lines.extend(["## 长期待审候选", ""])
+            for row, age_days, detail in aged_candidates:
+                reason = normalize_text(str(detail.get("summary") or "等待人工或模型复核"))
+                lines.append(
+                    f"- {row['canonical_name']} · {row['kind']}："
+                    f"已重复 {int(row['candidate_count'] or 0)} 次，积压 {age_days} 天；"
+                    f"{reason}（[来源]({row['url']}））"
+                )
+            lines.append("")
         return "\n".join(line for line in lines if line is not None)
 
     def render_linkedin_weekly_report(self, run_id: str) -> str:
