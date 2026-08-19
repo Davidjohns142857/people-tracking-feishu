@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import math
 import os
 import platform
+import secrets
 import shutil
 import stat
 import subprocess
@@ -16,6 +18,7 @@ from pathlib import Path
 from typing import Any
 
 from people_intel.deepseek_fallback import DeepSeekDiffReviewer, DeepSeekPolicyError
+from people_intel.light_cli import _public_urlopen
 from people_intel.light_tracker import ChangeDecision
 
 from . import __version__
@@ -65,6 +68,137 @@ def _json_file(path: Path) -> Any:
     if path.stat().st_size > 20 * 1024 * 1024:
         raise ValueError("input exceeds the 20 MiB safety limit")
     return json.loads(path.read_text(encoding="utf-8"))
+
+
+def _bridge_refs_hash(refs: list[str]) -> str:
+    encoded = json.dumps(sorted(refs), ensure_ascii=False, separators=(",", ":"))
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
+def _bridge_request_hash(*, purpose: str, content: Any) -> str:
+    encoded = json.dumps(
+        {"purpose": purpose, "content": content},
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    )
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
+def _new_bridge_request(
+    paths: RuntimePaths,
+    *,
+    purpose: str,
+    expected_refs: list[str],
+    request_content: Any,
+    state: PortableState | None = None,
+) -> dict[str, Any]:
+    refs = sorted(str(ref) for ref in expected_refs)
+    if not refs or len(refs) != len(set(refs)):
+        raise ValueError("bridge request must contain unique expected refs")
+    request_hash = _bridge_request_hash(purpose=purpose, content=request_content)
+    owned = state is None
+    active = state or PortableState(paths.database)
+    try:
+        existing = active.get_meta(f"bridge_request:{purpose}")
+        if (
+            isinstance(existing, dict)
+            and existing.get("status") == "pending"
+            and existing.get("expected_refs") == refs
+            and existing.get("expected_refs_hash") == _bridge_refs_hash(refs)
+            and existing.get("request_hash") == request_hash
+        ):
+            return existing
+        request = {
+            "schema_version": "people-tracking-bridge-v1",
+            "purpose": purpose,
+            "bridge_nonce": secrets.token_hex(16),
+            "expected_refs": refs,
+            "expected_refs_hash": _bridge_refs_hash(refs),
+            "request_hash": request_hash,
+            "created_at": utc_now(),
+            "status": "pending",
+        }
+        active.set_meta(f"bridge_request:{purpose}", request)
+        return request
+    finally:
+        if owned:
+            active.close()
+
+
+def _bridge_public_fields(request: dict[str, Any]) -> dict[str, Any]:
+    return {
+        key: request[key]
+        for key in (
+            "schema_version",
+            "purpose",
+            "bridge_nonce",
+            "expected_refs",
+            "expected_refs_hash",
+            "request_hash",
+        )
+    }
+
+
+def _validate_bridge_result(
+    paths: RuntimePaths,
+    payload: Any,
+    *,
+    purpose: str,
+    completed_refs: list[str],
+    state: PortableState | None = None,
+) -> dict[str, Any]:
+    if not isinstance(payload, dict) or payload.get("all_ok") is not True:
+        raise ValueError("bridge result must explicitly contain all_ok=true")
+    owned = state is None
+    active = state or PortableState(paths.database)
+    try:
+        request = active.get_meta(f"bridge_request:{purpose}")
+        if not isinstance(request, dict) or request.get("status") != "pending":
+            raise ValueError(f"no pending {purpose} bridge request exists")
+        expected = list(request.get("expected_refs") or [])
+        echoed = payload.get("expected_refs")
+        if payload.get("bridge_nonce") != request.get("bridge_nonce"):
+            raise ValueError("bridge result nonce does not match the pending request")
+        if echoed != expected:
+            raise ValueError("bridge result expected_refs do not match the pending request")
+        if payload.get("expected_refs_hash") != request.get("expected_refs_hash"):
+            raise ValueError("bridge result expected_refs_hash does not match the pending request")
+        if payload.get("request_hash") != request.get("request_hash"):
+            raise ValueError("bridge result request_hash does not match the pending request")
+        actual = [str(ref) for ref in completed_refs]
+        if len(actual) != len(set(actual)):
+            raise ValueError("bridge result contains duplicate refs")
+        missing = sorted(set(expected) - set(actual))
+        unknown = sorted(set(actual) - set(expected))
+        if missing or unknown:
+            raise ValueError(
+                "bridge result coverage mismatch: "
+                f"missing={missing or []}, unknown={unknown or []}"
+            )
+        consumed = {
+            **request,
+            "status": "consumed",
+            "consumed_at": utc_now(),
+        }
+        active.set_meta(f"bridge_request:{purpose}", consumed)
+        return consumed
+    finally:
+        if owned:
+            active.close()
+
+
+def _bridge_actions(actions: list[dict[str, Any]], request: dict[str, Any]) -> list[dict[str, Any]]:
+    fields = _bridge_public_fields(request)
+    return [{**action, **fields} for action in actions]
+
+
+def _master_expected_refs(records: dict[str, list[dict[str, Any]]]) -> list[str]:
+    refs = ["table:People", "table:Sources"]
+    for table in ("People", "Sources"):
+        refs.extend(f"{table}:{item['entity_key']}" for item in records.get(table, []))
+    return refs
 
 
 def _runtime_paths(args: argparse.Namespace) -> RuntimePaths:
@@ -336,12 +470,27 @@ def command_source_probe(args: argparse.Namespace, paths: RuntimePaths) -> dict[
         raise ValueError("enabled configuration cannot be silently revalidated; create a new draft")
     if args.bridge_results:
         results = _json_file(args.bridge_results)
-        if not isinstance(results, dict) or not results.get("all_ok"):
-            raise ValueError("bridge results must state all_ok=true")
+        sources = results.get("sources") if isinstance(results, dict) else None
+        if not isinstance(sources, list) or any(not isinstance(item, dict) for item in sources):
+            raise ValueError("bridge results must contain sources[]")
+        if any(item.get("ok") is not True for item in sources):
+            raise ValueError("every bridged source probe must state ok=true")
+        _validate_bridge_result(
+            paths,
+            results,
+            purpose="source_probe",
+            completed_refs=[str(item.get("source_ref") or "") for item in sources],
+        )
         validation = {
             "validated_at": utc_now(),
             "adapter": "agent_tool_bridge",
-            "results": results,
+            "results": sources,
+            "coverage": {
+                "expected_refs": results["expected_refs"],
+                "expected_refs_hash": results["expected_refs_hash"],
+                "request_hash": results["request_hash"],
+            },
+            "all_ok": True,
             "secret_values_read": False,
         }
         validated = mark_state(paths, config, "validated", validation=validation)
@@ -450,11 +599,18 @@ def command_source_probe(args: argparse.Namespace, paths: RuntimePaths) -> dict[
                 }
             )
     if bridge_actions:
+        request = _new_bridge_request(
+            paths,
+            purpose="source_probe",
+            expected_refs=[str(action["source_ref"]) for action in bridge_actions],
+            request_content={"actions": bridge_actions, "config": config},
+        )
         return {
             "state": "draft",
             "adapter": "agent_tool_bridge",
             "results": results,
-            "actions": bridge_actions,
+            "actions": _bridge_actions(bridge_actions, request),
+            "bridge_request": _bridge_public_fields(request),
             "next": "execute read-only actions with the official OpenClaw Feishu plugin and submit --bridge-results",
         }
     if not all(item.get("ok") for item in results):
@@ -472,11 +628,15 @@ def command_source_probe(args: argparse.Namespace, paths: RuntimePaths) -> dict[
 
 def _probe_api(source_ref: str, url: str) -> dict[str, Any]:
     try:
-        with urllib.request.urlopen(url.rstrip("/") + "/health", timeout=10) as response:
+        request = urllib.request.Request(
+            url.rstrip("/") + "/health",
+            headers={"Accept": "application/json"},
+        )
+        with _public_urlopen(request, timeout=10) as response:
             body = response.read(1_000_000)
         payload = json.loads(body) if body else {}
         return {"source_ref": source_ref, "kind": "people_intel_api", "ok": response.status == 200, "health": payload}
-    except (OSError, urllib.error.URLError, json.JSONDecodeError) as exc:
+    except (OSError, ValueError, urllib.error.URLError, json.JSONDecodeError) as exc:
         return {"source_ref": source_ref, "kind": "people_intel_api", "ok": False, "error": str(exc)}
 
 
@@ -490,8 +650,14 @@ def command_sync(args: argparse.Namespace, paths: RuntimePaths) -> dict[str, Any
     cli = _lark(args.lark_cli, strict=True) if mode == "claude_lark_cli" else None
     if args.master_bridge_results:
         payload = _json_file(args.master_bridge_results)
-        if not isinstance(payload, dict) or not payload.get("all_ok"):
-            raise ValueError("master bridge results must contain all_ok=true")
+        completed_refs = payload.get("completed_refs") if isinstance(payload, dict) else None
+        if not isinstance(completed_refs, list):
+            raise ValueError("master bridge results must contain completed_refs[]")
+        table_ids = payload.get("table_ids") or {}
+        if not all(str(table_ids.get(name) or "").strip() for name in ("People", "Sources")):
+            raise ValueError("master bridge results require People and Sources table IDs")
+        if not str(payload.get("base_token") or "").strip():
+            raise ValueError("master bridge results require base_token")
         master = dict(config.get("master_database") or {})
         master.update(
             {
@@ -506,6 +672,12 @@ def command_sync(args: argparse.Namespace, paths: RuntimePaths) -> dict[str, Any
         config["master_database"] = master
         config["updated_at"] = utc_now()
         validate_config(config, require_complete=True)
+        _validate_bridge_result(
+            paths,
+            payload,
+            purpose="master_sync",
+            completed_refs=[str(ref) for ref in completed_refs],
+        )
         secure_write_json(paths.config_file, config)
         return {"master_bridge_result_applied": True, "master_database": master}
     raw_batches: list[tuple[str, list[dict[str, Any]]]] = []
@@ -514,8 +686,34 @@ def command_sync(args: argparse.Namespace, paths: RuntimePaths) -> dict[str, Any
         batches = payload.get("sources") if isinstance(payload, dict) else None
         if not isinstance(batches, list):
             raise ValueError("bridge input must contain sources[]")
-        for batch in batches:
-            raw_batches.append((str(batch.get("source_ref") or "bridge"), records_from_payload(batch.get("payload"))))
+        if any(not isinstance(batch, dict) for batch in batches):
+            raise ValueError("bridge input sources must be objects")
+        parsed_batches = [
+            (
+                str(batch.get("source_ref") or ""),
+                records_from_payload(batch.get("payload")),
+            )
+            for batch in batches
+        ]
+        empty_payload_refs = [
+            ref
+            for (ref, records), batch in zip(parsed_batches, batches, strict=True)
+            if not records and batch.get("payload") not in ([], {"records": []})
+        ]
+        if empty_payload_refs:
+            raise ValueError(
+                "bridge source payload did not match the supported records schema: "
+                f"refs={empty_payload_refs}; use sources[].payload.records[]"
+            )
+        internal_empty = not batches and not getattr(args, "include_local_sources", True)
+        if not internal_empty:
+            _validate_bridge_result(
+                paths,
+                payload,
+                purpose="source_sync",
+                completed_refs=[ref for ref, _ in parsed_batches],
+            )
+        raw_batches.extend(parsed_batches)
         if getattr(args, "include_local_sources", True):
             bridged_refs = {ref for ref, _ in raw_batches}
             for index, source in enumerate(config["sources"]):
@@ -564,7 +762,19 @@ def command_sync(args: argparse.Namespace, paths: RuntimePaths) -> dict[str, Any
                     }
                 )
         if bridge_actions:
-            return {"apply": False, "adapter": "agent_tool_bridge", "actions": bridge_actions, "local_batches": len(raw_batches)}
+            request = _new_bridge_request(
+                paths,
+                purpose="source_sync",
+                expected_refs=[str(action["source_ref"]) for action in bridge_actions],
+                request_content={"actions": bridge_actions, "config": config},
+            )
+            return {
+                "apply": False,
+                "adapter": "agent_tool_bridge",
+                "actions": _bridge_actions(bridge_actions, request),
+                "bridge_request": _bridge_public_fields(request),
+                "local_batches": len(raw_batches),
+            }
     canonical_batches = [
         (ref, canonical_records(records, config["field_mapping"])) for ref, records in raw_batches
     ]
@@ -633,11 +843,25 @@ def command_sync(args: argparse.Namespace, paths: RuntimePaths) -> dict[str, Any
                 bridge_root = paths.state_root / "bridge"
                 bridge_root.mkdir(parents=True, exist_ok=True, mode=0o700)
                 bridge_file = bridge_root / "master-sync.json"
+                records = visible_records(state)
+                request = _new_bridge_request(
+                    paths,
+                    purpose="master_sync",
+                    expected_refs=_master_expected_refs(records),
+                    request_content={
+                        "operation": "create_and_sync_master_base",
+                        "master_database": master,
+                        "schema": master_schema(),
+                        "records": records,
+                    },
+                    state=state,
+                )
                 secure_write_json(
                     bridge_file,
                     {
                         "schema": master_schema(),
-                        "records": visible_records(state),
+                        "records": records,
+                        **_bridge_public_fields(request),
                         "synthetic": False,
                         "contains_secrets": False,
                     },
@@ -646,6 +870,7 @@ def command_sync(args: argparse.Namespace, paths: RuntimePaths) -> dict[str, Any
                     "adapter": "agent_tool_bridge",
                     "operation": "create_and_sync_master_base",
                     "payload_file": str(bridge_file),
+                    **_bridge_public_fields(request),
                     "next": "submit --master-bridge-results with actual Base/table/record IDs",
                 }
         if master.get("mode") == "existing_base":
@@ -664,12 +889,26 @@ def command_sync(args: argparse.Namespace, paths: RuntimePaths) -> dict[str, Any
                 bridge_root = paths.state_root / "bridge"
                 bridge_root.mkdir(parents=True, exist_ok=True, mode=0o700)
                 bridge_file = bridge_root / "master-sync.json"
+                records = visible_records(state)
+                request = _new_bridge_request(
+                    paths,
+                    purpose="master_sync",
+                    expected_refs=_master_expected_refs(records),
+                    request_content={
+                        "operation": "sync_existing_master_base",
+                        "master_database": master,
+                        "schema": master_schema(),
+                        "records": records,
+                    },
+                    state=state,
+                )
                 secure_write_json(
                     bridge_file,
                     {
                         "master_database": master,
                         "schema": master_schema(),
-                        "records": visible_records(state),
+                        "records": records,
+                        **_bridge_public_fields(request),
                         "synthetic": False,
                         "contains_secrets": False,
                     },
@@ -678,6 +917,7 @@ def command_sync(args: argparse.Namespace, paths: RuntimePaths) -> dict[str, Any
                     "adapter": "agent_tool_bridge",
                     "operation": "sync_existing_master_base",
                     "payload_file": str(bridge_file),
+                    **_bridge_public_fields(request),
                     "next": "submit --master-bridge-results with actual Base/table IDs",
                 }
         status = state.status()
@@ -1101,6 +1341,80 @@ def _register_openclaw_scheduler(
     return {"apply": apply, "jobs": plans}
 
 
+def _scan_interval(schedule: dict[str, Any]) -> timedelta:
+    cadence = str(schedule.get("scan") or "weekly")
+    intervals = {
+        "hourly": timedelta(hours=1),
+        "daily": timedelta(days=1),
+        "weekly": timedelta(days=7),
+    }
+    try:
+        return intervals[cadence]
+    except KeyError as exc:
+        raise ValueError("schedule.scan must be hourly, daily, or weekly") from exc
+
+
+def _sync_or_queue_visible_master(
+    state: PortableState,
+    paths: RuntimePaths,
+    config: dict[str, Any],
+    args: argparse.Namespace,
+) -> dict[str, Any] | None:
+    master = dict(config.get("master_database") or {})
+    if master.get("mode") != "existing_base":
+        return None
+    base_token = str(master.get("base_token") or "")
+    people_table = str(master.get("people_table_id") or master.get("people_table_name") or "")
+    sources_table = str(master.get("sources_table_id") or master.get("sources_table_name") or "")
+    if not base_token or not people_table or not sources_table:
+        raise ValueError("visible master sync requires base_token and People/Sources table IDs")
+    if _runtime_mode(config) == "claude_lark_cli":
+        cli = _lark(args.lark_cli, strict=True)
+        assert cli is not None
+        return sync_visible_master(
+            state,
+            cli,
+            base_token=base_token,
+            people_table_id=people_table,
+            sources_table_id=sources_table,
+            apply=True,
+        )
+    records = visible_records(state)
+    request = _new_bridge_request(
+        paths,
+        purpose="master_sync",
+        expected_refs=_master_expected_refs(records),
+        request_content={
+            "operation": "sync_existing_master_base",
+            "master_database": master,
+            "schema": master_schema(),
+            "records": records,
+        },
+        state=state,
+    )
+    bridge_root = paths.state_root / "bridge"
+    bridge_root.mkdir(parents=True, exist_ok=True, mode=0o700)
+    bridge_file = bridge_root / "scheduled-master-sync.json"
+    secure_write_json(
+        bridge_file,
+        {
+            "master_database": master,
+            "schema": master_schema(),
+            "records": records,
+            **_bridge_public_fields(request),
+            "synthetic": False,
+            "contains_secrets": False,
+        },
+    )
+    return {
+        "adapter": "agent_tool_bridge",
+        "operation": "sync_existing_master_base",
+        "payload_file": str(bridge_file),
+        **_bridge_public_fields(request),
+        "next": "sync every expected ref and submit --master-bridge-results",
+    }
+
+
 def command_schedule_tick(args: argparse.Namespace, paths: RuntimePaths) -> dict[str, Any]:
     config = load_config(paths)
     if config.get("state") != "enabled":
@@ -1112,10 +1426,16 @@ def command_schedule_tick(args: argparse.Namespace, paths: RuntimePaths) -> dict
         last_scan = state.get_meta("scheduler_last_scan_at")
         scan_due_now = True
         if last_scan:
-            scan_due_now = now - datetime.fromisoformat(last_scan) >= timedelta(days=7)
+            parsed_last_scan = datetime.fromisoformat(str(last_scan).replace("Z", "+00:00"))
+            if parsed_last_scan.tzinfo is None:
+                parsed_last_scan = parsed_last_scan.replace(tzinfo=timezone.utc)
+            scan_due_now = now - parsed_last_scan >= _scan_interval(config["schedule"])
         if scan_due_now:
             result = scan_due(state, paths, config)
             actions.append({"operation": "scan", "result": result})
+            master_result = _sync_or_queue_visible_master(state, paths, config, args)
+            if master_result is not None:
+                actions.append({"operation": "sync_visible_master", "result": master_result})
             if not result.get("validation", {}).get("passed", False):
                 return {
                     "skipped": False,
@@ -1287,6 +1607,10 @@ def main(argv: list[str] | None = None) -> int:
             "schedule-tick": command_schedule_tick,
         }
         data = handlers[args.command](args, paths)
+        scan_partial = (
+            args.command == "scan"
+            and data.get("tracker_run_status") == "partial"
+        )
         validation_failed = (
             args.command == "scan"
             and not data.get("validation", {}).get("passed", False)
@@ -1297,15 +1621,21 @@ def main(argv: list[str] | None = None) -> int:
             args.command == "schedule-tick"
             and bool(data.get("validation_failed"))
         )
-        if validation_failed:
+        if validation_failed or scan_partial:
+            error_type = "ScanPartialFailure" if scan_partial else "ScanValidationFailed"
+            error_message = (
+                "scan completed partially; source errors were preserved for retry"
+                if scan_partial
+                else "scan evidence was preserved, but strict validation failed"
+            )
             payload = {
                 "ok": False,
                 "command": args.command,
                 "version": __version__,
                 "data": data,
                 "error": {
-                    "type": "ScanValidationFailed",
-                    "message": "scan evidence was preserved, but strict validation failed",
+                    "type": error_type,
+                    "message": error_message,
                 },
             }
             print(json.dumps(payload, ensure_ascii=False, indent=2))

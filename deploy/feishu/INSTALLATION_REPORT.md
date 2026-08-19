@@ -6,11 +6,11 @@
 
 | 验收面 | 结果 |
 | --- | --- |
-| 全项目 pytest | 339/341 通过；2 项既有 Mono roster 输入 fixture 断言失败，与本版飞书/抓取修改无关 |
-| 便携层与抓取内核定向测试 | 73/73 通过 |
-| 包内离线 self-test | 8/8 通过；0 网络、0 billed token、0 真实人物 |
+| 全项目 pytest | 每次 CI 重新运行；不在静态文档固化易失效的测试数 |
+| 便携层与抓取内核定向测试 | 由 `.github/workflows/ci.yml` 与本地发布门同时执行 |
+| 包内离线 self-test | 每次构建从 ZIP 解包重跑；0 网络、0 billed token、0 真实人物 |
 | Skill 结构 | `quick_validate.py` 通过 |
-| release manifest | 87 个非 manifest 文件逐一 SHA-256 匹配 |
+| release manifest | 当次 ZIP 内所有非 manifest 文件逐一 SHA-256 匹配 |
 | release 安全扫描 | 0 secret、0 真实名单、0 数据库、0 本机绝对路径、0 symlink |
 | 安装隔离 | 临时 HOME 完成 apply、重复 apply、同名 Skill/launcher 备份与 rollback |
 | 无侵入性 | 预置 Claude settings hash 在 dry-run、拒绝 apply、成功 apply、重复 apply、rollback 后均不变 |

@@ -9,7 +9,7 @@
 
 配置、数据库、报告、备份和 secret 引用目录使用 0700；文件使用 0600。安装器不得打开飞书凭证文件，不得执行全局 editable pip 安装。
 
-任务名统一以 `people-tracking-feishu-` 开头。发现同名 OpenClaw cron、launchd plist 或 systemd unit 时停止，不覆盖。macOS/Linux 本地后台每 15 分钟运行一次内部 tick，由 SQLite 判断周扫、日报、周报是否到期。
+任务名统一以 `people-tracking-feishu-` 开头。发现同名 OpenClaw cron、launchd plist 或 systemd unit 时停止，不覆盖。macOS/Linux 本地后台每 15 分钟运行一次内部 tick，由 SQLite 按 `schedule.scan=hourly|daily|weekly` 判断扫描到期，并独立判断日报、周报。扫描完成后必须同步可见 Sources master；OpenClaw 模式会生成带完整 refs 的待执行 bridge action，不能把排队当作同步完成。
 
 投递幂等键为 `tracker_run_id + output_kind + period`。若文档已创建而消息失败，记录 `document_created`，重试只发消息。只有文档与消息都完成才标记 `completed`。
 
@@ -30,4 +30,4 @@ hostname 验证。证书过期、hostname mismatch 或链错误不得用 `-k`、
 严格复扫必须同时报告 enabled、planned、attempted、full-fetch planned/attempted、retry、
 健康分类和错误率。覆盖不足或错误率高于门限时不得发送“扫描成功”摘要。
 
-回滚只恢复本包建立的 Skill/launcher/service 备份。保留 SQLite、配置和报告，不删除用户数据。清理沙箱或 release 必须另行确认。
+回滚只恢复本包建立的 Skill/launcher/service 备份。保留 SQLite、配置和报告，不删除用户数据。回滚完成后 `install-state.json` 标记为 `rolled_back`；重复回滚返回幂等 replay，不再次移动文件。安装中途失败必须报告真实 `mutated` 和 mutation 路径，并自动尽可能恢复 Skill/launcher。清理沙箱或 release 必须另行确认。

@@ -3,9 +3,12 @@ from __future__ import annotations
 import io
 import json
 import ssl
+import sys
 import urllib.error
 import urllib.request
 from email.message import Message
+
+import pytest
 
 from people_intel import light_cli
 from people_intel.light_tracker import FetchObservation, extract_snapshot, health_status
@@ -41,7 +44,7 @@ def test_http_error_keeps_only_bounded_challenge_diagnostics(monkeypatch) -> Non
             io.BytesIO(body),
         )
 
-    monkeypatch.setattr(light_cli.urllib.request, "urlopen", blocked)
+    monkeypatch.setattr(light_cli, "_public_urlopen", blocked)
     observation = light_cli._http_fetch(
         "https://profiles.example/alice",
         headers={"User-Agent": "public-monitor"},
@@ -135,6 +138,213 @@ def test_http_200_waf_header_uses_registered_alternate(monkeypatch) -> None:
 
     assert observation.body == alternate_html
     assert observation.retrieval_mode == "alternate_public_url"
+
+
+def test_http_200_spa_shell_uses_registered_alternate(monkeypatch) -> None:
+    profile_url = "https://profiles.example/alice"
+    alternate_url = "https://backup.example/alice"
+    shell = b"<html><head><title>Alice Zhang</title></head><body><div id='root'></div></body></html>"
+    full_page = (
+        b"<html><head><title>Alice Zhang</title></head><body><main>"
+        b"<h1>Alice Zhang</h1><p>Research scientist working on reliable machine learning.</p>"
+        b"</main></body></html>"
+    )
+    calls: list[str] = []
+
+    def fake_http_fetch(url, *, headers, timeout=30):
+        calls.append(url)
+        if url == profile_url:
+            return FetchObservation(body=shell, final_url=url)
+        return FetchObservation(body=full_page, final_url=url)
+
+    monkeypatch.setattr(light_cli, "_http_fetch", fake_http_fetch)
+    observation = light_cli._fetch(
+        {
+            "kind": "homepage",
+            "url": profile_url,
+            "retrieval_config": {"alternate_urls": [alternate_url]},
+        }
+    )
+
+    assert calls == [profile_url, alternate_url]
+    assert observation.body == full_page
+    assert observation.retrieval_mode == "alternate_public_url"
+
+
+def test_success_body_over_limit_is_rejected_without_truncated_baseline(monkeypatch) -> None:
+    headers = Message()
+    headers["Content-Type"] = "text/html"
+
+    class Response:
+        status = 200
+        url = "https://example.com/profile"
+
+        def __init__(self):
+            self.headers = headers
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def read(self, limit):
+            assert limit == light_cli.MAX_HTTP_BODY_BYTES + 1
+            return b"x" * limit
+
+    monkeypatch.setattr(light_cli, "_public_urlopen", lambda *args, **kwargs: Response())
+    monkeypatch.setattr(
+        light_cli,
+        "_validate_public_url",
+        lambda value, *, resolve: str(value),
+    )
+    observation = light_cli._http_fetch(
+        "https://example.com/profile",
+        headers={"User-Agent": "public-monitor"},
+    )
+
+    assert observation.status_code == 200
+    assert observation.body is None
+    assert "exceeds 3000000-byte safety limit" in observation.error
+    assert health_status(observation, "homepage")[0] == "transport_error"
+
+
+def test_public_redirect_rejects_private_and_token_targets() -> None:
+    handler = light_cli._SafePublicRedirect()
+    request = urllib.request.Request("https://example.com/profile")
+    for target in (
+        "http://169.254.169.254/latest/meta-data/",
+        "https://example.com/profile?access_token=secret",
+    ):
+        try:
+            handler.redirect_request(request, None, 302, "Found", {}, target)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f"unsafe redirect accepted: {target}")
+
+
+def test_public_url_allows_proxy_fake_ip_only_through_loopback_proxy(monkeypatch) -> None:
+    monkeypatch.setattr(
+        light_cli.socket,
+        "getaddrinfo",
+        lambda *args, **kwargs: [(2, 1, 6, "", ("198.18.5.161", 443))],
+    )
+    monkeypatch.setattr(
+        light_cli.urllib.request,
+        "getproxies",
+        lambda: {"https": "http://127.0.0.1:7890"},
+    )
+    monkeypatch.setattr(
+        light_cli.urllib.request,
+        "proxy_bypass",
+        lambda hostname: False,
+    )
+
+    assert light_cli._validate_public_url(
+        "https://scholar.google.com/citations?user=example",
+        resolve=True,
+    ) == "https://scholar.google.com/citations?user=example"
+
+
+def test_public_url_rejects_proxy_fake_ip_without_usable_local_proxy(monkeypatch) -> None:
+    monkeypatch.setattr(
+        light_cli.socket,
+        "getaddrinfo",
+        lambda *args, **kwargs: [(2, 1, 6, "", ("198.18.5.161", 443))],
+    )
+    monkeypatch.setattr(light_cli.urllib.request, "getproxies", lambda: {})
+    monkeypatch.setattr(
+        light_cli.urllib.request,
+        "proxy_bypass",
+        lambda hostname: False,
+    )
+
+    with pytest.raises(ValueError, match="resolved to a non-public address"):
+        light_cli._validate_public_url(
+            "https://scholar.google.com/citations?user=example",
+            resolve=True,
+        )
+
+
+def test_public_url_rejects_private_dns_even_with_loopback_proxy(monkeypatch) -> None:
+    monkeypatch.setattr(
+        light_cli.socket,
+        "getaddrinfo",
+        lambda *args, **kwargs: [(2, 1, 6, "", ("10.0.0.8", 443))],
+    )
+    monkeypatch.setattr(
+        light_cli.urllib.request,
+        "getproxies",
+        lambda: {"https": "http://127.0.0.1:7890"},
+    )
+    monkeypatch.setattr(
+        light_cli.urllib.request,
+        "proxy_bypass",
+        lambda hostname: False,
+    )
+
+    with pytest.raises(ValueError, match="resolved to a non-public address"):
+        light_cli._validate_public_url("https://example.com/profile", resolve=True)
+
+
+def test_primary_source_rejects_private_url_before_fetch(monkeypatch) -> None:
+    monkeypatch.setattr(
+        light_cli,
+        "_http_fetch",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("private primary URL must not be fetched")
+        ),
+    )
+    observation = light_cli._fetch(
+        {"kind": "homepage", "url": "http://127.0.0.1/private"}
+    )
+    assert observation.body is None
+    assert "public URL safety policy" in observation.error
+
+
+def test_scan_live_skips_disabled_sources(monkeypatch, tmp_path, capsys) -> None:
+    database = tmp_path / "tracker.sqlite3"
+    tracker = light_cli.LightTracker(database)
+    person = tracker.add_person(
+        "Alice Zhang",
+        urls=["https://example.com/alice", "https://backup.example.com/alice"],
+    )
+    disabled_id = person["sources"][0]["source_id"]
+    tracker.db.execute(
+        "UPDATE sources SET tracking_enabled=0 WHERE source_id=?", (disabled_id,)
+    )
+    tracker.db.commit()
+    tracker.close()
+    fetched: list[str] = []
+
+    def fake_fetch(source):
+        fetched.append(source["source_id"])
+        return FetchObservation(
+            body=(
+                "<html><title>Alice Zhang</title><h1>Alice Zhang</h1>"
+                "<p>Machine learning research profile.</p></html>"
+            ),
+            final_url=source["url"],
+        )
+
+    monkeypatch.setattr(light_cli, "_fetch", fake_fetch)
+    monkeypatch.setattr(
+        light_cli.DeepSeekSettings,
+        "from_runtime",
+        lambda *args, **kwargs: type(
+            "Settings", (), {"public_status": lambda self: {}}
+        )(),
+    )
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["people-tracker-lite", "--db", str(database), "scan-live", "--no-deepseek"],
+    )
+    light_cli.main()
+    capsys.readouterr()
+    assert disabled_id not in fetched
+    assert len(fetched) == 1
 
 
 def test_huggingface_overview_api_is_projected_after_captcha(monkeypatch) -> None:

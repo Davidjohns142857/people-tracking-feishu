@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import json
 import re
+import tomllib
 from pathlib import Path
 
 
@@ -25,6 +26,14 @@ def main() -> int:
     version = (ROOT / "VERSION").read_text(encoding="utf-8").strip()
     if not VERSION_PATTERN.fullmatch(version):
         failures.append("invalid VERSION")
+
+    pyproject = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))
+    expected_python_version = version.split("-portable.", 1)[0]
+    if pyproject.get("project", {}).get("version") != expected_python_version:
+        failures.append("pyproject version does not match VERSION base")
+    scripts = pyproject.get("project", {}).get("scripts", {})
+    if scripts.get("people-tracking-feishu") != "people_tracking_feishu.cli:main":
+        failures.append("people-tracking-feishu console entry is missing")
 
     skill = ROOT / "packages/feishu/people-tracking/SKILL.md"
     text = skill.read_text(encoding="utf-8")

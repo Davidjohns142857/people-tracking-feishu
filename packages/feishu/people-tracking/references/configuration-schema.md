@@ -70,7 +70,13 @@
 }
 ```
 
+`schedule.timezone` 必须是可加载的 IANA 时区；`scan` 只允许 `hourly`、`daily`、
+`weekly`。日报时间严格使用 `HH:MM`，周报时间严格使用 `DDD HH:MM`（`DDD` 为
+`MON`—`SUN`）。后台 tick 固定每 15 分钟唤醒，但按该 cadence 判断扫描是否到期。
+
 来源 `kind` 只允许：`feishu_base`、`feishu_doc`、`feishu_wiki`、`local_file`、`people_intel_api`。
+`people_intel_api` 只接受通过公开 URL 安全门的 HTTPS 地址；禁止 loopback、私网、
+link-local、URL credentials、token query 和非 80/443 端口。
 
 ## 逐来源公开抓取路由
 

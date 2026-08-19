@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import importlib.util
 import json
 import os
 import sqlite3
@@ -22,7 +23,14 @@ from people_tracking_feishu.config import (
     secure_write_json,
     validate_config,
 )
-from people_tracking_feishu.cli import command_bootstrap, command_sync, parser
+from people_tracking_feishu.cli import (
+    command_bootstrap,
+    command_schedule_tick,
+    command_source_probe,
+    command_sync,
+    main,
+    parser,
+)
 from people_tracking_feishu.ingest import canonical_records, records_from_file
 from people_tracking_feishu.lark import LarkCli
 from people_tracking_feishu.master import create_master_base, sync_visible_master
@@ -140,6 +148,35 @@ def test_markdown_sync_keeps_missing_anchor_in_review(tmp_path: Path):
         }
         assert state.status()["counts"]["people"] == 1
         assert state.status()["counts"]["open_intake_issues"] == 1
+    finally:
+        state.close()
+
+
+def test_incoming_human_field_conflict_preserves_curated_value(tmp_path: Path):
+    state = PortableState(tmp_path / "human-fields.sqlite3")
+    try:
+        first = {
+            "canonical_name": "Synthetic Curated",
+            "secondary_id": "curated-1",
+            "aliases": [],
+            "urls": ["https://synthetic.invalid/curated"],
+            "profile": {"school": "Human Curated University"},
+            "source_record_id": "record-1",
+        }
+        second = {
+            **first,
+            "profile": {"school": "Incoming Machine University"},
+            "source_record_id": "record-2",
+        }
+        state.import_people([first], source_ref="manual-master")
+        state.import_people([second], source_ref="incoming-source")
+        person = state.tracker.list_people()[0]
+        assert person["profile"]["school"] == "Human Curated University"
+        conflict = state.db.execute(
+            "SELECT current_value_json,incoming_value_json FROM human_conflicts"
+        ).fetchone()
+        assert json.loads(conflict["current_value_json"]) == "Human Curated University"
+        assert json.loads(conflict["incoming_value_json"]) == "Incoming Machine University"
     finally:
         state.close()
 
@@ -272,6 +309,235 @@ def test_scheduler_artifacts_are_namespaced(tmp_path: Path):
     assert {path.suffix for path in linux} == {".service", ".timer"}
     assert all("people-tracking-feishu-" in path.name for path in linux)
     assert b"schedule-tick" in next(content for path, content in linux.items() if path.suffix == ".service")
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("timezone", "Mars/Olympus"),
+        ("scan", "fortnightly"),
+        ("daily_digest", "25:99"),
+        ("weekly_digest", "FUNDAY 08:30"),
+    ],
+)
+def test_schedule_configuration_is_strict(tmp_path: Path, field: str, value: str):
+    payload = answers(tmp_path / "people.md")
+    payload["schedule"][field] = value
+    with pytest.raises(ConfigError):
+        normalize_answers(payload)
+
+
+def test_people_intel_api_reuses_public_https_url_gate(tmp_path: Path):
+    for unsafe in (
+        "http://127.0.0.1:8080",
+        "https://169.254.169.254/latest",
+        "https://user:password@example.org/api",
+        "https://example.org/api?token=secret",
+    ):
+        payload = answers(tmp_path / "people.md")
+        payload["sources"] = [{"kind": "people_intel_api", "url": unsafe}]
+        with pytest.raises(ConfigError):
+            normalize_answers(payload)
+
+
+def test_people_intel_api_probe_uses_redirect_safe_public_opener(monkeypatch):
+    import people_tracking_feishu.cli as cli_module
+
+    calls = []
+
+    class Response:
+        status = 200
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def read(self, limit):
+            assert limit == 1_000_000
+            return b'{"status":"healthy"}'
+
+    def safe_open(request, *, timeout):
+        calls.append((request.full_url, timeout))
+        return Response()
+
+    monkeypatch.setattr(cli_module, "_public_urlopen", safe_open)
+    monkeypatch.setattr(
+        cli_module.urllib.request,
+        "urlopen",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("raw urlopen bypassed the public redirect gate")
+        ),
+    )
+    result = cli_module._probe_api("source-1", "https://api.example.org/v1")
+
+    assert calls == [("https://api.example.org/v1/health", 10)]
+    assert result["ok"] is True
+    assert result["health"] == {"status": "healthy"}
+
+
+def test_source_probe_bridge_requires_exact_nonce_hash_and_full_coverage(tmp_path: Path):
+    payload = answers(tmp_path / "unused.md")
+    payload["runtime"] = {"mode": "openclaw"}
+    payload["sources"] = [
+        {"kind": "feishu_doc", "url": "https://synthetic.feishu.cn/docx/one"},
+        {"kind": "feishu_doc", "url": "https://synthetic.feishu.cn/docx/two"},
+    ]
+    paths = _bootstrap_paths(tmp_path)
+    secure_write_json(paths.config_file, normalize_answers(payload))
+    waiting = command_source_probe(argparse.Namespace(lark_cli=None, bridge_results=None), paths)
+    request = waiting["bridge_request"]
+    partial = tmp_path / "partial-probe.json"
+    secure_write_json(
+        partial,
+        {
+            "all_ok": True,
+            "bridge_nonce": request["bridge_nonce"],
+            "expected_refs": request["expected_refs"],
+            "expected_refs_hash": request["expected_refs_hash"],
+            "request_hash": request["request_hash"],
+            "sources": [{"source_ref": "source-1", "ok": True}],
+        },
+    )
+    with pytest.raises(ValueError, match="coverage mismatch"):
+        command_source_probe(argparse.Namespace(lark_cli=None, bridge_results=partial), paths)
+    duplicate = tmp_path / "duplicate-probe.json"
+    secure_write_json(
+        duplicate,
+        {
+            "all_ok": True,
+            "bridge_nonce": request["bridge_nonce"],
+            "expected_refs": request["expected_refs"],
+            "expected_refs_hash": request["expected_refs_hash"],
+            "request_hash": request["request_hash"],
+            "sources": [
+                {"source_ref": "source-1", "ok": True},
+                {"source_ref": "source-1", "ok": True},
+            ],
+        },
+    )
+    with pytest.raises(ValueError, match="duplicate"):
+        command_source_probe(argparse.Namespace(lark_cli=None, bridge_results=duplicate), paths)
+    complete = tmp_path / "complete-probe.json"
+    secure_write_json(
+        complete,
+        {
+            "all_ok": True,
+            "bridge_nonce": request["bridge_nonce"],
+            "expected_refs": request["expected_refs"],
+            "expected_refs_hash": request["expected_refs_hash"],
+            "request_hash": request["request_hash"],
+            "sources": [
+                {"source_ref": ref, "ok": True}
+                for ref in request["expected_refs"]
+            ],
+        },
+    )
+    result = command_source_probe(argparse.Namespace(lark_cli=None, bridge_results=complete), paths)
+    assert result["state"] == "validated"
+
+
+def test_bridge_request_rotates_when_action_content_changes_and_rejects_old_result(
+    tmp_path: Path,
+):
+    payload = answers(tmp_path / "unused.md")
+    payload["runtime"] = {"mode": "openclaw"}
+    payload["sources"] = [
+        {"kind": "feishu_doc", "url": "https://synthetic.feishu.cn/docx/one"},
+    ]
+    paths = _bootstrap_paths(tmp_path)
+    config = normalize_answers(payload)
+    secure_write_json(paths.config_file, config)
+    first = command_source_probe(
+        argparse.Namespace(lark_cli=None, bridge_results=None),
+        paths,
+    )["bridge_request"]
+
+    config["sources"][0]["url"] = "https://synthetic.feishu.cn/docx/two"
+    secure_write_json(paths.config_file, config)
+    second = command_source_probe(
+        argparse.Namespace(lark_cli=None, bridge_results=None),
+        paths,
+    )["bridge_request"]
+
+    assert second["expected_refs"] == first["expected_refs"] == ["source-1"]
+    assert second["request_hash"] != first["request_hash"]
+    assert second["bridge_nonce"] != first["bridge_nonce"]
+
+    stale = tmp_path / "stale-probe.json"
+    secure_write_json(
+        stale,
+        {
+            "all_ok": True,
+            "bridge_nonce": first["bridge_nonce"],
+            "expected_refs": first["expected_refs"],
+            "expected_refs_hash": first["expected_refs_hash"],
+            "request_hash": first["request_hash"],
+            "sources": [{"source_ref": "source-1", "ok": True}],
+        },
+    )
+    with pytest.raises(ValueError, match="nonce"):
+        command_source_probe(
+            argparse.Namespace(lark_cli=None, bridge_results=stale),
+            paths,
+        )
+
+
+def test_source_sync_bridge_rejects_missing_or_unknown_batches(tmp_path: Path):
+    payload = answers(tmp_path / "unused.md")
+    payload["runtime"] = {"mode": "openclaw"}
+    payload["sources"] = [
+        {"kind": "feishu_doc", "url": "https://synthetic.feishu.cn/docx/one"},
+        {"kind": "feishu_doc", "url": "https://synthetic.feishu.cn/docx/two"},
+    ]
+    config = normalize_answers(payload)
+    config["state"] = "enabled"
+    config["validation"] = {"all_ok": True}
+    paths = _bootstrap_paths(tmp_path)
+    secure_write_json(paths.config_file, config)
+    args = argparse.Namespace(
+        lark_cli=None,
+        bridge_input=None,
+        master_bridge_results=None,
+        apply=True,
+    )
+    waiting = command_sync(args, paths)
+    request = waiting["bridge_request"]
+    bridge = tmp_path / "partial-sync.json"
+    secure_write_json(
+        bridge,
+        {
+            "all_ok": True,
+            "bridge_nonce": request["bridge_nonce"],
+            "expected_refs": request["expected_refs"],
+            "expected_refs_hash": request["expected_refs_hash"],
+            "request_hash": request["request_hash"],
+            "sources": [{"source_ref": "unknown", "payload": {"records": []}}],
+        },
+    )
+    args.bridge_input = bridge
+    with pytest.raises(ValueError, match="coverage mismatch"):
+        command_sync(args, paths)
+
+    malformed = tmp_path / "malformed-sync.json"
+    secure_write_json(
+        malformed,
+        {
+            "all_ok": True,
+            "bridge_nonce": request["bridge_nonce"],
+            "expected_refs": request["expected_refs"],
+            "expected_refs_hash": request["expected_refs_hash"],
+            "request_hash": request["request_hash"],
+            "sources": [
+                {"source_ref": "source-1", "records": []},
+                {"source_ref": "source-2", "payload": {"rows": []}},
+            ],
+        },
+    )
+    args.bridge_input = malformed
+    with pytest.raises(ValueError, match=r"sources\[\]\.payload\.records\[\]"):
+        command_sync(args, paths)
 
 
 def _bootstrap_paths(tmp_path: Path) -> RuntimePaths:
@@ -429,10 +695,16 @@ def test_bootstrap_resumes_source_and_master_feishu_bridges(
 
     source_wait = command_bootstrap(_bootstrap_args(), paths)
     assert source_wait["status"] == "waiting_for_source_bridge"
+    source_request = source_wait["actions"][0]
     source_result = tmp_path / "source-result.json"
     secure_write_json(
         source_result,
         {
+            "all_ok": True,
+            "bridge_nonce": source_request["bridge_nonce"],
+            "expected_refs": source_request["expected_refs"],
+            "expected_refs_hash": source_request["expected_refs_hash"],
+            "request_hash": source_request["request_hash"],
             "sources": [
                 {
                     "source_ref": "source-1",
@@ -457,11 +729,17 @@ def test_bootstrap_resumes_source_and_master_feishu_bridges(
         paths,
     )
     assert master_wait["status"] == "waiting_for_master_bridge"
+    master_request = master_wait["actions"][0]
     master_result = tmp_path / "master-result.json"
     secure_write_json(
         master_result,
         {
             "all_ok": True,
+            "bridge_nonce": master_request["bridge_nonce"],
+            "expected_refs": master_request["expected_refs"],
+            "expected_refs_hash": master_request["expected_refs_hash"],
+            "request_hash": master_request["request_hash"],
+            "completed_refs": master_request["expected_refs"],
             "base_token": "bas_synthetic",
             "base_url": "https://synthetic.feishu.cn/base/bas_synthetic",
             "table_ids": {"People": "tbl_people", "Sources": "tbl_sources"},
@@ -552,6 +830,31 @@ def test_install_dry_run_does_not_modify_home(tmp_path: Path):
     assert hashlib.sha256(sentinel.read_bytes()).hexdigest() == before
 
 
+def test_release_verification_ignores_only_derived_python_bytecode(tmp_path: Path):
+    build = subprocess.run(
+        [sys.executable, str(ROOT / "scripts/build_feishu_release.py"), "--output-dir", str(tmp_path)],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    archive = Path(json.loads(build.stdout)["archive"])
+    extract = tmp_path / "extract-bytecode"
+    with zipfile.ZipFile(archive) as handle:
+        handle.extractall(extract)
+    release = extract / f"people-tracking-feishu-{RELEASE_VERSION}"
+    cache = release / "runtime/people_tracking_feishu/__pycache__"
+    cache.mkdir()
+    (cache / "cli.cpython-312.pyc").write_bytes(b"derived-bytecode")
+    verify = subprocess.run(
+        [sys.executable, str(release / "verify_release.py")],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert verify.returncode == 0, verify.stdout + verify.stderr
+    assert json.loads(verify.stdout)["ok"] is True
+
+
 def test_install_apply_repeat_and_rollback_preserve_existing_files(tmp_path: Path):
     build = subprocess.run(
         [sys.executable, str(ROOT / "scripts/build_feishu_release.py"), "--output-dir", str(tmp_path)],
@@ -614,7 +917,10 @@ def test_install_apply_repeat_and_rollback_preserve_existing_files(tmp_path: Pat
         / "bin/python"
     ).is_file()
     second = subprocess.run(command, capture_output=True, text=True, env=environment, check=True, timeout=180)
-    assert json.loads(second.stdout)["result"]["state"]["skills"][0]["changed"] is False
+    # ``changed`` is ownership state for rollback, not merely this invocation's
+    # copy count. A repeated install carries the original backup and therefore
+    # remains explicitly rollback-owned.
+    assert json.loads(second.stdout)["result"]["state"]["skills"][0]["changed"] is True
     rolled = subprocess.run(
         [sys.executable, str(release / "install_bundle.py"), "--rollback", "--home", str(home)],
         capture_output=True,
@@ -626,6 +932,105 @@ def test_install_apply_repeat_and_rollback_preserve_existing_files(tmp_path: Pat
     assert (existing_skill / "SKILL.md").read_text(encoding="utf-8") == "old-skill\n"
     assert "old-launcher" in launcher.read_text(encoding="utf-8")
     assert hashlib.sha256(settings.read_bytes()).hexdigest() == settings_hash
+    replay = subprocess.run(
+        [sys.executable, str(release / "install_bundle.py"), "--rollback", "--home", str(home)],
+        capture_output=True,
+        text=True,
+        env=environment,
+        check=True,
+    )
+    assert json.loads(replay.stdout)["idempotent_replay"] is True
+
+
+def test_install_failure_reports_mutation_rolls_back_and_consumes_state(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    module_path = ROOT / "deploy/feishu/install_bundle.py"
+    spec = importlib.util.spec_from_file_location("portable_install_bundle_test", module_path)
+    assert spec and spec.loader
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    home = tmp_path / "failed-home"
+    preview = {
+        "runtime_mode": "claude_lark_cli",
+        "paths": {
+            "release": str(home / ".local/share/people-tracking-feishu/releases/test"),
+            "config": str(home / ".config/people-tracking-feishu"),
+            "state": str(home / ".local/state/people-tracking-feishu"),
+            "venv": str(home / ".local/state/people-tracking-feishu/venvs/test"),
+            "launcher": str(home / ".local/bin/people-tracking-feishu"),
+            "skills": [],
+        },
+    }
+
+    def fail_after_launcher(args, root, install_home, install_preview):
+        launcher = Path(install_preview["paths"]["launcher"])
+        module.secure_write(launcher, "#!/bin/sh\nexit 1\n")
+        raise RuntimeError("synthetic mid-install failure")
+
+    monkeypatch.setattr(module, "_apply_install_unchecked", fail_after_launcher)
+    with pytest.raises(module.InstallFailure) as raised:
+        module.apply_install(argparse.Namespace(), ROOT, home, preview)
+    assert raised.value.mutated is True
+    assert raised.value.rollback_result["rolled_back"] is True
+    install_state = home / ".config/people-tracking-feishu/install-state.json"
+    state = json.loads(install_state.read_text(encoding="utf-8"))
+    assert state["status"] == "rolled_back"
+    assert state["rollback"]["status"] == "completed"
+    replay = module.rollback(home)
+    assert replay["idempotent_replay"] is True
+
+
+def test_failed_install_rollback_never_touches_unchanged_skill_with_old_backup(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    module_path = ROOT / "deploy/feishu/install_bundle.py"
+    spec = importlib.util.spec_from_file_location("portable_install_unchanged_test", module_path)
+    assert spec and spec.loader
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    home = tmp_path / "failed-home"
+    skill = home / ".claude/skills/people-tracking"
+    skill.mkdir(parents=True)
+    (skill / "SKILL.md").write_text("current-skill\n", encoding="utf-8")
+    old_backup = skill.with_name("people-tracking.backup-20260101T000000Z")
+    old_backup.mkdir()
+    (old_backup / "SKILL.md").write_text("stale-skill\n", encoding="utf-8")
+    preview = {
+        "runtime_mode": "claude_lark_cli",
+        "paths": {
+            "release": str(home / ".local/share/people-tracking-feishu/releases/test"),
+            "config": str(home / ".config/people-tracking-feishu"),
+            "state": str(home / ".local/state/people-tracking-feishu"),
+            "venv": str(home / ".local/state/people-tracking-feishu/venvs/test"),
+            "launcher": str(home / ".local/bin/people-tracking-feishu"),
+            "skills": [str(skill)],
+        },
+    }
+
+    def fail_after_unrelated_release_mutation(args, root, install_home, install_preview):
+        release = Path(install_preview["paths"]["release"])
+        release.mkdir(parents=True)
+        (release / "partial").write_text("new", encoding="utf-8")
+        raise RuntimeError("synthetic failure before skill install")
+
+    monkeypatch.setattr(
+        module,
+        "_apply_install_unchecked",
+        fail_after_unrelated_release_mutation,
+    )
+    with pytest.raises(module.InstallFailure) as raised:
+        module.apply_install(argparse.Namespace(), ROOT, home, preview)
+
+    assert raised.value.mutated is True
+    assert (skill / "SKILL.md").read_text(encoding="utf-8") == "current-skill\n"
+    assert (old_backup / "SKILL.md").read_text(encoding="utf-8") == "stale-skill\n"
+    assert not any(
+        action.get("moved") == str(skill)
+        for action in raised.value.rollback_result["actions"]
+    )
 
 
 def _enabled_scan_config(tmp_path: Path) -> tuple[RuntimePaths, dict]:
@@ -891,6 +1296,125 @@ def test_scan_validation_failure_keeps_written_observation(
         state.close()
 
 
+def test_portable_scan_records_partial_tracker_run_and_cli_returns_nonzero(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+):
+    import people_tracking_feishu.cli as cli_module
+    import people_tracking_feishu.tracking as tracking_module
+
+    paths, config = _enabled_scan_config(tmp_path)
+    state = PortableState(paths.database)
+    try:
+        person = state.tracker.add_person(
+            "Synthetic Partial",
+            urls=["https://synthetic.invalid/partial"],
+        )
+        source_id = person["sources"][0]["source_id"]
+        monkeypatch.setattr(
+            tracking_module,
+            "_fetch_with_policy",
+            lambda *args, **kwargs: (_ for _ in ()).throw(
+                RuntimeError("synthetic fetch crash")
+            ),
+        )
+        result = tracking_module.scan_due(
+            state,
+            paths,
+            config,
+            source_kinds=["homepage"],
+        )
+        run = state.db.execute(
+            "SELECT status,observation_errors,error_json FROM runs WHERE run_id=?",
+            (result["tracker_run_id"],),
+        ).fetchone()
+        assert result["tracker_run_status"] == "partial"
+        assert result["validation"]["passed"] is False
+        assert result["validation"]["error_sources"] == 1
+        assert "internal exceptions" in result["validation"]["reasons"][0]
+        assert result["metrics"]["observation_errors"][0]["source_id"] == source_id
+        assert state.get_meta("last_tracker_run_id") is None
+        assert tuple(run)[:2] == ("partial", 1)
+        assert json.loads(run["error_json"])[0]["phase"] == "fetch"
+    finally:
+        state.close()
+
+    monkeypatch.setattr(cli_module, "_runtime_paths", lambda args: paths)
+    monkeypatch.setattr(cli_module, "command_scan", lambda args, runtime_paths: result)
+    assert cli_module.main(["scan", "--json"]) == 3
+    envelope = json.loads(capsys.readouterr().out)
+    assert envelope["ok"] is False
+    assert envelope["error"]["type"] == "ScanPartialFailure"
+
+
+def test_portable_scan_marks_tracker_run_failed_on_fatal_post_loop_error(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    from people_intel.light_tracker import FetchObservation
+    import people_tracking_feishu.tracking as tracking_module
+
+    paths, config = _enabled_scan_config(tmp_path)
+    state = PortableState(paths.database)
+    try:
+        state.tracker.add_person(
+            "Synthetic Fatal",
+            urls=["https://synthetic.invalid/fatal"],
+        )
+        monkeypatch.setattr(
+            tracking_module,
+            "_fetch",
+            lambda source: FetchObservation(
+                body=(
+                    "<html><h1>Synthetic Fatal</h1><h2>Research</h2>"
+                    "<p>Reliable machine learning systems.</p></html>"
+                ),
+                status_code=200,
+            ),
+        )
+        monkeypatch.setattr(
+            tracking_module,
+            "_scan_validation",
+            lambda *args, **kwargs: (_ for _ in ()).throw(
+                RuntimeError("synthetic fatal validation crash")
+            ),
+        )
+        with pytest.raises(RuntimeError, match="fatal validation"):
+            tracking_module.scan_due(
+                state,
+                paths,
+                config,
+                source_kinds=["homepage"],
+                homepage_retries=0,
+            )
+        run = state.db.execute(
+            "SELECT status,error_json FROM runs ORDER BY started_at DESC LIMIT 1"
+        ).fetchone()
+        assert run["status"] == "failed"
+        assert json.loads(run["error_json"])["type"] == "RuntimeError"
+    finally:
+        state.close()
+
+
+def test_fail_run_does_not_overwrite_completed_tracker_run(tmp_path: Path):
+    from people_intel.light_tracker import LightTracker
+
+    tracker = LightTracker(tmp_path / "guarded-failure.sqlite3")
+    try:
+        run_id = tracker.start_run("completed-before-downstream-error")
+        tracker.complete_run(run_id)
+        tracker.fail_run(run_id, RuntimeError("late downstream failure"))
+        run = tracker.db.execute(
+            "SELECT status,error_json FROM runs WHERE run_id=?",
+            (run_id,),
+        ).fetchone()
+        assert run["status"] == "completed"
+        assert run["error_json"] is None
+    finally:
+        tracker.close()
+
+
 def test_scan_coverage_validation_rejects_partial_force_all() -> None:
     import people_tracking_feishu.tracking as tracking_module
 
@@ -909,6 +1433,89 @@ def test_scan_coverage_validation_rejects_partial_force_all() -> None:
     assert validation["coverage"]["sources_enabled"] == 2
     assert any("planned 1 of 2 enabled" in reason for reason in validation["reasons"])
     assert any("full-body fetch attempted 0 of 1" in reason for reason in validation["reasons"])
+
+
+def test_strict_scan_rejects_zero_enabled_zero_observed_and_cli_surfaces_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+):
+    import people_tracking_feishu.cli as cli_module
+    import people_tracking_feishu.tracking as tracking_module
+
+    paths, config = _enabled_scan_config(tmp_path)
+    state = PortableState(paths.database)
+    try:
+        result = tracking_module.scan_due(
+            state,
+            paths,
+            config,
+            force_all=True,
+            force_full_fetch=True,
+        )
+    finally:
+        state.close()
+    assert result["validation"]["passed"] is False
+    assert result["validation"]["coverage"]["sources_enabled"] == 0
+    assert "zero enabled sources" in result["validation"]["reasons"][0]
+    monkeypatch.setattr(cli_module, "_runtime_paths", lambda args: paths)
+    monkeypatch.setattr(cli_module, "command_scan", lambda args, runtime_paths: result)
+    assert cli_module.main(["scan", "--force-all", "--json"]) == 3
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["ok"] is False
+    assert payload["error"]["type"] == "ScanValidationFailed"
+
+
+def test_schedule_tick_consumes_hourly_cadence_and_queues_visible_master(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    import people_tracking_feishu.cli as cli_module
+
+    source = tmp_path / "scheduled.md"
+    source.write_text("synthetic", encoding="utf-8")
+    payload = answers(source)
+    payload["runtime"] = {"mode": "openclaw"}
+    payload["schedule"]["scan"] = "hourly"
+    payload["master_database"] = {
+        "mode": "existing_base",
+        "url": "https://synthetic.feishu.cn/base/master",
+        "base_token": "bas_master",
+        "people_table_id": "tbl_people",
+        "sources_table_id": "tbl_sources",
+    }
+    config = normalize_answers(payload)
+    config["state"] = "enabled"
+    config["validation"] = {"all_ok": True}
+    paths = _bootstrap_paths(tmp_path)
+    secure_write_json(paths.config_file, config)
+    state = PortableState(paths.database)
+    try:
+        state.set_meta(
+            "scheduler_last_scan_at",
+            (datetime.now(timezone.utc) - timedelta(hours=2)).isoformat(),
+        )
+    finally:
+        state.close()
+    scans: list[bool] = []
+    monkeypatch.setattr(
+        cli_module,
+        "scan_due",
+        lambda *args, **kwargs: (
+            scans.append(True)
+            or {"validation": {"passed": True}, "tracker_run_id": "tracker-scheduled"}
+        ),
+    )
+    monkeypatch.setattr(cli_module, "_digest_due_now", lambda *args, **kwargs: False)
+    result = command_schedule_tick(argparse.Namespace(lark_cli=None), paths)
+    assert scans == [True]
+    assert [item["operation"] for item in result["actions"]] == [
+        "scan",
+        "sync_visible_master",
+    ]
+    master = result["actions"][1]["result"]
+    assert master["operation"] == "sync_existing_master_base"
+    assert master["expected_refs"] == ["table:People", "table:Sources"]
 
 
 def test_scan_cli_returns_nonzero_and_false_envelope_when_validation_fails(

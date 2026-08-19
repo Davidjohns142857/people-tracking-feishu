@@ -253,6 +253,29 @@ def test_linkedin_authwall_is_health_issue_not_profile_change():
     assert health_status(observation, "linkedin")[0] == "blocked"
 
 
+def test_linkedin_http_999_is_anonymous_access_block_not_transport_error():
+    observation = FetchObservation(
+        body=None,
+        status_code=999,
+        final_url="https://www.linkedin.com/in/example",
+        error="HTTP Error 999: Request denied",
+    )
+    assert health_status(observation, "linkedin") == ("blocked", "HTTP 999")
+
+
+def test_linkedin_blocked_canary_error_is_not_transport_error():
+    observation = FetchObservation(
+        body=None,
+        status_code=0,
+        final_url="https://www.linkedin.com/in/example",
+        error="direct route skipped after blocked canaries",
+    )
+    assert health_status(observation, "linkedin") == (
+        "blocked",
+        "direct route skipped after blocked canaries",
+    )
+
+
 def test_http_status_takes_precedence_over_transport_error_text():
     observation = FetchObservation(
         body=None,
@@ -351,6 +374,15 @@ def test_homepage_canonical_url_preserves_meaningful_www_authority():
     assert canonical_url(
         "https://www.github.com/alice/"
     ) == "https://github.com/alice"
+
+
+def test_homepage_canonical_url_preserves_functional_query_and_drops_tracking():
+    assert canonical_url(
+        "https://profiles.example/person?lang=zh&view=research&utm_source=newsletter&fbclid=x"
+    ) == "https://profiles.example/person?lang=zh&view=research"
+    assert canonical_url(
+        "https://pkuzqh.github.io/?utmsource=chatgpt.com"
+    ) == "https://pkuzqh.github.io/"
 
 
 def test_merges_name_variant_when_stable_anchor_matches(tmp_path):

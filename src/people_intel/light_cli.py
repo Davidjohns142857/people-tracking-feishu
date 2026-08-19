@@ -8,6 +8,7 @@ import ipaddress
 import json
 import os
 import re
+import socket
 import ssl
 import urllib.error
 import urllib.parse
@@ -25,12 +26,15 @@ from people_intel.deepseek_fallback import (
 from people_intel.light_tracker import (
     FetchObservation,
     LightTracker,
+    assess_snapshot,
     dossier_records,
+    extract_snapshot,
     utc_now,
 )
 
 
 HTTP_ERROR_PREFIX_LIMIT = 16_384
+MAX_HTTP_BODY_BYTES = 3_000_000
 DIAGNOSTIC_HEADERS = (
     "Server",
     "CF-Mitigated",
@@ -75,6 +79,7 @@ CUHK_TLS12_STATIC_RSA_HOSTS = frozenset(
     }
 )
 CUHK_TLS12_STATIC_RSA_CIPHERS = "AES128-GCM-SHA256:@SECLEVEL=2"
+PROXY_FAKE_IP_NETWORK = ipaddress.ip_network("198.18.0.0/15")
 WESTLAKE_FACULTY_INLINE_URL = (
     "https://en.westlake.edu.cn/faculty/weicheng-zang.html"
 )
@@ -130,11 +135,22 @@ class _ExactHostTLSHTTPSHandler(urllib.request.HTTPSHandler):
         )
 
 
+class _SafePublicRedirect(urllib.request.HTTPRedirectHandler):
+    """Revalidate every redirect target before urllib follows it."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        _validate_public_url(newurl, resolve=True)
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
 def _public_urlopen(request: urllib.request.Request, *, timeout: int):
-    if _uses_cuhk_tls12_static_rsa(request.full_url):
-        opener = urllib.request.build_opener(_ExactHostTLSHTTPSHandler())
-        return opener.open(request, timeout=timeout)
-    return urllib.request.urlopen(request, timeout=timeout)
+    _validate_public_url(request.full_url, resolve=True)
+    handlers: list[urllib.request.BaseHandler] = [
+        _SafePublicRedirect(),
+        _ExactHostTLSHTTPSHandler(),
+    ]
+    opener = urllib.request.build_opener(*handlers)
+    return opener.open(request, timeout=timeout)
 
 
 def _header_value(headers: object, name: str) -> str:
@@ -349,8 +365,23 @@ def _http_fetch(
             urllib.request.Request(url, headers=headers),
             timeout=timeout,
         ) as response:
+            _validate_public_url(response.url, resolve=True)
+            body = response.read(MAX_HTTP_BODY_BYTES + 1)
+            if len(body) > MAX_HTTP_BODY_BYTES:
+                return FetchObservation(
+                    body=None,
+                    status_code=response.status,
+                    final_url=response.url,
+                    content_type=response.headers.get_content_type(),
+                    error=(
+                        f"public response exceeds {MAX_HTTP_BODY_BYTES}-byte safety limit; "
+                        "confirmed baseline preserved"
+                    ),
+                    etag=response.headers.get("ETag"),
+                    last_modified=response.headers.get("Last-Modified"),
+                )
             observation = FetchObservation(
-                body=response.read(3_000_000),
+                body=body,
                 status_code=response.status,
                 final_url=response.url,
                 content_type=response.headers.get_content_type(),
@@ -503,34 +534,34 @@ def _wordpress_projection(
     )
 
 
-def _safe_registered_url(value: object) -> str | None:
+def _validate_public_url(value: object, *, resolve: bool) -> str:
     if not isinstance(value, str):
-        return None
+        raise ValueError("public URL must be a string")
     url = value.strip()
     try:
         parsed = urllib.parse.urlsplit(url)
         port = parsed.port
     except ValueError:
-        return None
+        raise ValueError("invalid public URL") from None
     if parsed.scheme not in {"http", "https"} or not parsed.hostname:
-        return None
+        raise ValueError("public URL must use http(s) with a hostname")
     if parsed.username or parsed.password:
-        return None
+        raise ValueError("credential-bearing public URL rejected")
     if port not in {None, 80, 443}:
-        return None
+        raise ValueError("non-standard public URL port rejected")
     if parsed.fragment:
-        return None
+        raise ValueError("public URL fragments are not fetched")
     hostname = parsed.hostname.casefold().rstrip(".")
     if hostname == "localhost" or hostname.endswith((".localhost", ".local")):
-        return None
+        raise ValueError("local hostname rejected")
     try:
         address = ipaddress.ip_address(hostname)
     except ValueError:
         if "." not in hostname or re.fullmatch(r"[0-9.]+", hostname):
-            return None
+            raise ValueError("invalid public hostname")
     else:
         if not address.is_global:
-            return None
+            raise ValueError("non-public IP address rejected")
     query_names = {
         key.casefold().replace("-", "_")
         for key, _ in urllib.parse.parse_qsl(parsed.query, keep_blank_values=True)
@@ -541,8 +572,63 @@ def _safe_registered_url(value: object) -> str | None:
         for match in re.finditer(r"(?:^|[&;])([^=&;]+)=", decoded_query)
     }
     if (query_names | raw_query_names) & REGISTERED_CREDENTIAL_QUERY_NAMES:
-        return None
+        raise ValueError("credential/token query parameter rejected")
+    if resolve:
+        try:
+            addresses = {
+                item[4][0]
+                for item in socket.getaddrinfo(
+                    hostname,
+                    port or (443 if parsed.scheme == "https" else 80),
+                    type=socket.SOCK_STREAM,
+                )
+            }
+        except socket.gaierror as exc:
+            raise ValueError("public hostname did not resolve") from exc
+        if not addresses:
+            raise ValueError("public hostname did not resolve")
+        parsed_addresses = [ipaddress.ip_address(value) for value in addresses]
+        proxy_fake_ip_resolution = (
+            all(address in PROXY_FAKE_IP_NETWORK for address in parsed_addresses)
+            and _uses_loopback_proxy(parsed.scheme, hostname)
+        )
+        if (
+            any(not address.is_global for address in parsed_addresses)
+            and not proxy_fake_ip_resolution
+        ):
+            raise ValueError("public hostname resolved to a non-public address")
     return url
+
+
+def _uses_loopback_proxy(scheme: str, hostname: str) -> bool:
+    """Allow RFC 2544 Fake-IP DNS only when urllib will use a local proxy."""
+
+    if urllib.request.proxy_bypass(hostname):
+        return False
+    proxy = urllib.request.getproxies().get(scheme)
+    if not isinstance(proxy, str) or not proxy.strip():
+        return False
+    value = proxy.strip()
+    if "://" not in value:
+        value = f"http://{value}"
+    try:
+        parsed = urllib.parse.urlsplit(value)
+        proxy_host = (parsed.hostname or "").casefold().rstrip(".")
+    except ValueError:
+        return False
+    if proxy_host == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(proxy_host).is_loopback
+    except ValueError:
+        return False
+
+
+def _safe_registered_url(value: object) -> str | None:
+    try:
+        return _validate_public_url(value, resolve=False)
+    except ValueError:
+        return None
 
 
 def _alternate_route_specs(config: dict[str, object]) -> list[tuple[str, str]]:
@@ -1270,6 +1356,19 @@ def _fetch_alternate_routes(
     return None
 
 
+def _homepage_body_is_low_quality(observation: FetchObservation) -> bool:
+    """Recognize a successful HTTP response that is only a SPA/title shell."""
+
+    if observation.body is None or not 200 <= observation.status_code < 300:
+        return False
+    try:
+        snapshot = extract_snapshot("homepage", observation.body)
+        _, _, usable = assess_snapshot(snapshot)
+    except (TypeError, ValueError, UnicodeError, json.JSONDecodeError):
+        return True
+    return not usable
+
+
 def parser() -> argparse.ArgumentParser:
     root = argparse.ArgumentParser(prog="people-tracker-lite")
     root.add_argument("--db", default=".people_intel/light-tracker.sqlite3")
@@ -1309,6 +1408,13 @@ def parser() -> argparse.ArgumentParser:
 
 def _fetch(source: dict[str, object]) -> FetchObservation:
     url = str(source["url"])
+    if _safe_registered_url(url) is None:
+        return FetchObservation(
+            body=None,
+            status_code=0,
+            final_url=url,
+            error="registered source URL failed the public URL safety policy",
+        )
     if source.get("kind") == "github":
         login = url.rstrip("/").rsplit("/", 1)[-1]
         api_headers = {
@@ -1405,8 +1511,17 @@ def _fetch(source: dict[str, object]) -> FetchObservation:
                     direct_fingerprint = _observation_fingerprint(direct)
             else:
                 direct.retrieval_mode = "meta_refresh_rejected"
+    alternate_specs = _alternate_route_specs(config)
+    low_quality_shell = (
+        source.get("kind") == "homepage"
+        and bool(alternate_specs)
+        and direct_fingerprint is None
+        and _homepage_body_is_low_quality(direct)
+    )
     if direct.status_code == 304 or (
-        direct.body is not None and direct_fingerprint is None
+        direct.body is not None
+        and direct_fingerprint is None
+        and not low_quality_shell
     ):
         return direct
 
@@ -1425,6 +1540,7 @@ def _fetch(source: dict[str, object]) -> FetchObservation:
 def main() -> None:
     args = parser().parse_args()
     tracker = LightTracker(args.db)
+    active_run_id: str | None = None
     try:
         if args.command == "init":
             print(json.dumps({"database": str(Path(args.db).resolve()), "status": "ready"}, ensure_ascii=False))
@@ -1444,6 +1560,7 @@ def main() -> None:
             print(json.dumps(tracker.list_people(), ensure_ascii=False, indent=2))
         elif args.command == "scan-live":
             run_id = tracker.start_run("cli-live")
+            active_run_id = run_id
             try:
                 settings = DeepSeekSettings.from_runtime(args.deepseek_config)
                 reviewer = (
@@ -1462,6 +1579,8 @@ def main() -> None:
                 if args.person_key and person["person_key"] != args.person_key:
                     continue
                 for source in person["sources"]:
+                    if int(source.get("tracking_enabled", 1)) != 1:
+                        continue
                     tracker.observe(
                         run_id,
                         source["source_id"],
@@ -1470,6 +1589,7 @@ def main() -> None:
                         ai_usage_sink=ai_usage,
                     )
             tracker.complete_run(run_id)
+            active_run_id = None
             usage_after = reviewer.usage_snapshot() if reviewer else {}
             usage_delta = {
                 key: max(0, int(usage_after.get(key, 0)) - int(usage_before.get(key, 0)))
@@ -1506,6 +1626,7 @@ def main() -> None:
             if not isinstance(entries, list):
                 raise ValueError("linkedin-ingest expects a list or {'observations': [...]} JSON")
             run_id = tracker.start_run("weekly-linkedin")
+            active_run_id = run_id
             outcomes = []
             for entry in entries:
                 if not isinstance(entry, dict) or not entry.get("source_id"):
@@ -1528,6 +1649,7 @@ def main() -> None:
                     "summary": decision.summary,
                 })
             tracker.complete_run(run_id)
+            active_run_id = None
             print(json.dumps({
                 "run_id": run_id,
                 "outcomes": outcomes,
@@ -1535,6 +1657,10 @@ def main() -> None:
             }, ensure_ascii=False, indent=2))
         elif args.command == "linkedin-report":
             print(tracker.render_linkedin_weekly_report(args.run_id))
+    except BaseException as exc:
+        if active_run_id is not None:
+            tracker.fail_run(active_run_id, exc)
+        raise
     finally:
         tracker.close()
 

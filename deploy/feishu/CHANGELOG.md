@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.8.1-portable.1 — 2026-08-19
+
+- 修复本机 loopback proxy 使用 RFC 2544 Fake-IP DNS 时被公网 URL 安全门误拦截的问题；只允许 `198.18.0.0/15` 全量解析且目标域名未 bypass、匹配代理确为 loopback 的组合，普通私网与非 loopback 代理仍拒绝。
+- LinkedIn HTTP 999、authwall/CAPTCHA 和 blocked-canary fallback 现在归类为匿名访问受限而非传输未知，旧基线继续受保护且不得据此推断离职。
+- 隔离 `production` 与 `acceptance`/`validation` run：验收不再推进正式 baseline 或候选确认，同一 run 也不能重复计数。
+- run 失败与部分失败现在有独立状态和错误审计；CLI 在 partial 时返回非零退出码。
+- 主 URL 与每次 redirect 都执行公网 URL/DNS/IP 安全门；拒绝私网、凭据、token query、异常端口和超大响应。
+- HTTP 200 SPA 空壳可转入已登记 fallback，软退役 source 不再被扫描，Homepage 功能 query 被保留且跟踪 query 被移除。
+- Bridge 必须带一次性 nonce、预期 source refs 和绑定 action/payload 的请求哈希；错误记录容器、缺项或裸 `all_ok=true` 不再能让 bootstrap 误报 ready。
+- 人工维护字段冲突时保留原值；严格扫描 0/0 失败；schedule 真正消费 hourly/daily/weekly cadence 并同步可见总库。
+- 安装中途失败会如实报告已变更路径并尝试回滚；rollback 可重复调用且不会再次移走已恢复目标。
+- Skill 入口禁写包内 bytecode，验签器安全忽略安装器本就排除的派生缓存；按推荐顺序先 doctor 再验签/安装不再自我阻断。
+
 ## 0.8.0-portable.1 — 2026-08-10
 
 - 同步 8 月 10 日抓取内核：识别 HTTP 200 CAPTCHA/WAF、JS 空壳和零条目页面，失败不覆盖旧基线。
