@@ -1,7 +1,9 @@
 # Changelog
 
-## 0.8.1-portable.1 — 2026-08-13
+## 0.8.1-portable.1 — 2026-08-19
 
+- 修复本机 loopback proxy 使用 RFC 2544 Fake-IP DNS 时被公网 URL 安全门误拦截的问题；只允许 `198.18.0.0/15` 全量解析且目标域名未 bypass、匹配代理确为 loopback 的组合，普通私网与非 loopback 代理仍拒绝。
+- LinkedIn HTTP 999、authwall/CAPTCHA 和 blocked-canary fallback 现在归类为匿名访问受限而非传输未知，旧基线继续受保护且不得据此推断离职。
 - 隔离 `production` 与 `acceptance`/`validation` run：验收不再推进正式 baseline 或候选确认，同一 run 也不能重复计数。
 - run 失败与部分失败现在有独立状态和错误审计；CLI 在 partial 时返回非零退出码。
 - 主 URL 与每次 redirect 都执行公网 URL/DNS/IP 安全门；拒绝私网、凭据、token query、异常端口和超大响应。

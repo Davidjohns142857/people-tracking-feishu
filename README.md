@@ -16,6 +16,8 @@ OpenClaw 或 Claude Agent，以 SQLite 保存确认基线、候选变化、来�
 - 304 使用当前比较器重验旧候选；`www` ID 迁移和页脚噪声不再被快速确认。
 - `source_routes[]` 可登记匿名公开 fallback、软退役或替换来源；历史来源、观察、候选和基线不删除。
 - 公开 route 拒绝 URL credentials、token query、私网/本机地址和非标准端口。
+- RFC 2544 Fake-IP DNS 只在目标域名实际经 loopback HTTP(S) proxy 转发时放行；普通私网、混合解析和 proxy bypass 仍拒绝。
+- LinkedIn HTTP 999、authwall/CAPTCHA 与 blocked-canary 统一记为匿名访问受限，保留旧基线且不推断任职变化。
 - TLS 兼容只允许 exact-host 策略，并始终保留 CA 与 hostname 验证。
 - `acceptance`/`validation` 扫描不推进正式 baseline 或候选，同一 run 不重复计数。
 - Bridge 要求 nonce、预期 source refs 与哈希完整回填；裸 `all_ok=true` 不能将 bootstrap 标记为 ready。
