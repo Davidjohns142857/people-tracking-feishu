@@ -253,6 +253,29 @@ def test_linkedin_authwall_is_health_issue_not_profile_change():
     assert health_status(observation, "linkedin")[0] == "blocked"
 
 
+def test_linkedin_http_999_is_anonymous_access_block_not_transport_error():
+    observation = FetchObservation(
+        body=None,
+        status_code=999,
+        final_url="https://www.linkedin.com/in/example",
+        error="HTTP Error 999: Request denied",
+    )
+    assert health_status(observation, "linkedin") == ("blocked", "HTTP 999")
+
+
+def test_linkedin_blocked_canary_error_is_not_transport_error():
+    observation = FetchObservation(
+        body=None,
+        status_code=0,
+        final_url="https://www.linkedin.com/in/example",
+        error="direct route skipped after blocked canaries",
+    )
+    assert health_status(observation, "linkedin") == (
+        "blocked",
+        "direct route skipped after blocked canaries",
+    )
+
+
 def test_http_status_takes_precedence_over_transport_error_text():
     observation = FetchObservation(
         body=None,

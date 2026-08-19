@@ -8,6 +8,8 @@ import urllib.error
 import urllib.request
 from email.message import Message
 
+import pytest
+
 from people_intel import light_cli
 from people_intel.light_tracker import FetchObservation, extract_snapshot, health_status
 
@@ -220,6 +222,70 @@ def test_public_redirect_rejects_private_and_token_targets() -> None:
             pass
         else:
             raise AssertionError(f"unsafe redirect accepted: {target}")
+
+
+def test_public_url_allows_proxy_fake_ip_only_through_loopback_proxy(monkeypatch) -> None:
+    monkeypatch.setattr(
+        light_cli.socket,
+        "getaddrinfo",
+        lambda *args, **kwargs: [(2, 1, 6, "", ("198.18.5.161", 443))],
+    )
+    monkeypatch.setattr(
+        light_cli.urllib.request,
+        "getproxies",
+        lambda: {"https": "http://127.0.0.1:7890"},
+    )
+    monkeypatch.setattr(
+        light_cli.urllib.request,
+        "proxy_bypass",
+        lambda hostname: False,
+    )
+
+    assert light_cli._validate_public_url(
+        "https://scholar.google.com/citations?user=example",
+        resolve=True,
+    ) == "https://scholar.google.com/citations?user=example"
+
+
+def test_public_url_rejects_proxy_fake_ip_without_usable_local_proxy(monkeypatch) -> None:
+    monkeypatch.setattr(
+        light_cli.socket,
+        "getaddrinfo",
+        lambda *args, **kwargs: [(2, 1, 6, "", ("198.18.5.161", 443))],
+    )
+    monkeypatch.setattr(light_cli.urllib.request, "getproxies", lambda: {})
+    monkeypatch.setattr(
+        light_cli.urllib.request,
+        "proxy_bypass",
+        lambda hostname: False,
+    )
+
+    with pytest.raises(ValueError, match="resolved to a non-public address"):
+        light_cli._validate_public_url(
+            "https://scholar.google.com/citations?user=example",
+            resolve=True,
+        )
+
+
+def test_public_url_rejects_private_dns_even_with_loopback_proxy(monkeypatch) -> None:
+    monkeypatch.setattr(
+        light_cli.socket,
+        "getaddrinfo",
+        lambda *args, **kwargs: [(2, 1, 6, "", ("10.0.0.8", 443))],
+    )
+    monkeypatch.setattr(
+        light_cli.urllib.request,
+        "getproxies",
+        lambda: {"https": "http://127.0.0.1:7890"},
+    )
+    monkeypatch.setattr(
+        light_cli.urllib.request,
+        "proxy_bypass",
+        lambda hostname: False,
+    )
+
+    with pytest.raises(ValueError, match="resolved to a non-public address"):
+        light_cli._validate_public_url("https://example.com/profile", resolve=True)
 
 
 def test_primary_source_rejects_private_url_before_fetch(monkeypatch) -> None:

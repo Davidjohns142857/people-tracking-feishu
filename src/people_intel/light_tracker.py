@@ -1116,6 +1116,8 @@ def health_status(observation: FetchObservation, expected_kind: str) -> tuple[st
         return "rate_limited", "HTTP 429"
     if code in {401, 403}:
         return "blocked", f"HTTP {code}"
+    if expected_kind == "linkedin" and code == 999:
+        return "blocked", "HTTP 999"
     if code >= 500:
         return "temporary_error", f"HTTP {code}"
     if observation.error:
@@ -1124,7 +1126,19 @@ def health_status(observation: FetchObservation, expected_kind: str) -> tuple[st
         # bounded, cookie-free access fingerprint.  Treat it as an anonymous
         # access restriction rather than a network failure so the old baseline
         # is preserved and the report explains the real cause.
-        if "access_fingerprint=" in observation.error.casefold():
+        normalized_error = observation.error.casefold()
+        if "access_fingerprint=" in normalized_error:
+            return "blocked", observation.error
+        if expected_kind == "linkedin" and any(
+            marker in normalized_error
+            for marker in (
+                "http 999",
+                "authentication wall",
+                "authwall",
+                "captcha",
+                "blocked canaries",
+            )
+        ):
             return "blocked", observation.error
         return "transport_error", observation.error
     final = (observation.final_url or "").casefold()

@@ -79,6 +79,7 @@ CUHK_TLS12_STATIC_RSA_HOSTS = frozenset(
     }
 )
 CUHK_TLS12_STATIC_RSA_CIPHERS = "AES128-GCM-SHA256:@SECLEVEL=2"
+PROXY_FAKE_IP_NETWORK = ipaddress.ip_network("198.18.0.0/15")
 WESTLAKE_FACULTY_INLINE_URL = (
     "https://en.westlake.edu.cn/faculty/weicheng-zang.html"
 )
@@ -586,9 +587,41 @@ def _validate_public_url(value: object, *, resolve: bool) -> str:
             raise ValueError("public hostname did not resolve") from exc
         if not addresses:
             raise ValueError("public hostname did not resolve")
-        if any(not ipaddress.ip_address(value).is_global for value in addresses):
+        parsed_addresses = [ipaddress.ip_address(value) for value in addresses]
+        proxy_fake_ip_resolution = (
+            all(address in PROXY_FAKE_IP_NETWORK for address in parsed_addresses)
+            and _uses_loopback_proxy(parsed.scheme, hostname)
+        )
+        if (
+            any(not address.is_global for address in parsed_addresses)
+            and not proxy_fake_ip_resolution
+        ):
             raise ValueError("public hostname resolved to a non-public address")
     return url
+
+
+def _uses_loopback_proxy(scheme: str, hostname: str) -> bool:
+    """Allow RFC 2544 Fake-IP DNS only when urllib will use a local proxy."""
+
+    if urllib.request.proxy_bypass(hostname):
+        return False
+    proxy = urllib.request.getproxies().get(scheme)
+    if not isinstance(proxy, str) or not proxy.strip():
+        return False
+    value = proxy.strip()
+    if "://" not in value:
+        value = f"http://{value}"
+    try:
+        parsed = urllib.parse.urlsplit(value)
+        proxy_host = (parsed.hostname or "").casefold().rstrip(".")
+    except ValueError:
+        return False
+    if proxy_host == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(proxy_host).is_loopback
+    except ValueError:
+        return False
 
 
 def _safe_registered_url(value: object) -> str | None:
