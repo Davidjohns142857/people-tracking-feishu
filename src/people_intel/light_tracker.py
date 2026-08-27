@@ -398,8 +398,14 @@ class _SemanticHTMLParser(HTMLParser):
     EXCLUDED_TAGS = {"style", "noscript", "svg", "canvas", "template", "form", "button"}
     VOID_TAGS = {"area", "base", "br", "col", "embed", "hr", "img", "input", "link", "meta", "param", "source", "track", "wbr"}
 
-    def __init__(self) -> None:
+    SEMANTIC_CONTAINER_RE = re.compile(
+        r"(?:^|\s)(?:field__item|field__label)(?:\s|$)",
+        re.I,
+    )
+
+    def __init__(self, *, recover_profile_blocks: bool = False) -> None:
         super().__init__(convert_charrefs=True)
+        self.recover_profile_blocks = recover_profile_blocks
         self.stack: list[tuple[str, bool]] = []
         self.current_tag: str | None = None
         self.current_text: list[str] = []
@@ -417,7 +423,12 @@ class _SemanticHTMLParser(HTMLParser):
         amap = {k.casefold(): v or "" for k, v in attrs}
         descriptor = " ".join((amap.get("id", ""), amap.get("class", ""), amap.get("role", ""))).casefold()
         parent_excluded = self.stack[-1][1] if self.stack else False
-        excluded = parent_excluded or tag in self.EXCLUDED_TAGS or bool(
+        excluded_tags = (
+            self.EXCLUDED_TAGS - {"form"}
+            if self.recover_profile_blocks
+            else self.EXCLUDED_TAGS
+        )
+        excluded = parent_excluded or tag in excluded_tags or bool(
             re.search(r"\b(nav|footer|cookie|consent|modal|menu|toolbar|advert|social-share)\b", descriptor)
         )
         if tag == "script" and amap.get("type", "").casefold() == "application/ld+json":
@@ -439,7 +450,12 @@ class _SemanticHTMLParser(HTMLParser):
             self.current_links.append(amap["href"])
         if tag not in self.VOID_TAGS:
             self.stack.append((tag, excluded))
-        if tag in self.BLOCK_TAGS and not excluded:
+        semantic_container = (
+            self.recover_profile_blocks
+            and tag == "div"
+            and bool(self.SEMANTIC_CONTAINER_RE.search(amap.get("class", "")))
+        )
+        if (tag in self.BLOCK_TAGS or semantic_container) and not excluded:
             self.current_tag, self.current_text, self.current_attrs, self.current_links = tag, [], amap, []
 
     def handle_endtag(self, tag: str) -> None:
@@ -696,11 +712,27 @@ def _finalize_snapshot(
     )
 
 
-def _extract_generic(body: str, kind: str = "homepage") -> FeatureSnapshot:
-    parser = _SemanticHTMLParser()
+def _extract_generic_once(
+    body: str,
+    kind: str = "homepage",
+    *,
+    recover_profile_blocks: bool = False,
+) -> FeatureSnapshot:
+    parser = _SemanticHTMLParser(
+        recover_profile_blocks=recover_profile_blocks,
+    )
     parser.feed(body)
     if len(parser.blocks) <= 1:
-        cleaned = re.sub(r"(?is)<(script|style|noscript|nav|footer|form)\b.*?</\1>", " ", body)
+        removable = (
+            "script|style|noscript|nav|footer"
+            if recover_profile_blocks
+            else "script|style|noscript|nav|footer|form"
+        )
+        cleaned = re.sub(
+            rf"(?is)<({removable})\b.*?</\1>",
+            " ",
+            body,
+        )
         for match in re.finditer(r"(?is)<(h[1-4]|p|li|td)\b[^>]*>(.*?)</\1>", cleaned):
             text = normalize_text(re.sub(r"(?is)<[^>]+>", " ", match.group(2)))
             if text:
@@ -791,7 +823,33 @@ def _extract_generic(body: str, kind: str = "homepage") -> FeatureSnapshot:
             if tag != "title" and normalize_key(text) not in NOISE_TEXT
         ],
         identity_text=" ".join([*identity.values(), identity_text]),
+        extractor_version=(
+            "semantic-manifest-v5-homepage-tolerant-blocks"
+            if recover_profile_blocks and kind == "homepage"
+            else "semantic-manifest-v4"
+        ),
     )
+
+
+def _extract_generic(body: str, kind: str = "homepage") -> FeatureSnapshot:
+    primary = _extract_generic_once(body, kind)
+    if (
+        kind != "homepage"
+        or (primary.item_count >= 3 and primary.token_count >= 5)
+    ):
+        return primary
+
+    recovered = _extract_generic_once(
+        body,
+        kind,
+        recover_profile_blocks=True,
+    )
+    if (
+        recovered.item_count > primary.item_count
+        and recovered.token_count > primary.token_count
+    ):
+        return recovered
+    return primary
 
 
 def _linkedin_experience_stable_id(entry: dict[str, Any]) -> str | None:
@@ -1038,6 +1096,14 @@ def _extract_scholar(body: str) -> FeatureSnapshot:
         sentinels.append("profile-name")
     if parser.rows:
         sentinels.append("publication-table")
+    if re.search(
+        r"(?:There are no articles in this profile|"
+        r"This profile has no articles|"
+        r"此(?:学术搜索)?个人学术档案中没有文章)",
+        body,
+        re.I,
+    ):
+        sentinels.append("empty-publication-table")
     return _finalize_snapshot(
         "scholar",
         identity,
@@ -1329,7 +1395,15 @@ def assess_snapshot(
     reasons: list[str] = []
     usable = True
     minimum_tokens = {"homepage": 5, "scholar": 4, "github": 1, "linkedin": 6}[snapshot.kind]
-    if snapshot.token_count < minimum_tokens or snapshot.item_count == 0:
+    explicit_empty_scholar = (
+        snapshot.kind == "scholar"
+        and "empty-publication-table" in snapshot.sentinels
+        and bool(snapshot.identity.get("name"))
+    )
+    if (
+        not explicit_empty_scholar
+        and (snapshot.token_count < minimum_tokens or snapshot.item_count == 0)
+    ):
         score -= 0.45
         reasons.append("提取到的稳定内容过少")
         # Identity metadata alone is useful for binding, but it is not a
@@ -2402,7 +2476,61 @@ class LightTracker:
                 "truncated": snapshot.truncated,
                 "binding": asdict(identity_result),
             }
-            if not usable:
+            limited_baseline_heartbeat = bool(
+                not usable
+                and old is not None
+                and source["kind"] in {"linkedin", "scholar"}
+                and identity_result.status == "verified"
+                and old.extractor_version == snapshot.extractor_version
+                and old.retrieval_mode == snapshot.retrieval_mode
+                and old.semantic_hash == snapshot.semantic_hash
+                and bool(old.comparison_hash)
+                and old.comparison_hash == snapshot.comparison_hash
+                and identity_result.evidence.get("expected_external_id")
+                == identity_result.evidence.get("observed_external_id")
+            )
+            quality_payload["limited_baseline_heartbeat"] = (
+                limited_baseline_heartbeat
+            )
+            if limited_baseline_heartbeat:
+                transition_started = perf_counter()
+                decision = ChangeDecision(
+                    "unchanged",
+                    0.0,
+                    "公开来源仍与已确认的有限基线逐哈希一致；"
+                    "本轮仅确认来源可达，不放宽人物变化确认门",
+                    health_status="healthy",
+                    quality_score=quality_score,
+                    quality_reasons=quality_reasons,
+                )
+                self.db.execute(
+                    """UPDATE sources SET health_status='healthy',
+                       health_detail='limited confirmed baseline unchanged',
+                       consecutive_failures=0,last_checked_at=?,last_full_fetch_at=?,
+                       quality_json=?,etag=COALESCE(?,etag),
+                       last_modified=COALESCE(?,last_modified),binding_status=?,
+                       binding_confidence=?,binding_reason=?,binding_evidence_json=?,
+                       binding_verified_at=? WHERE source_id=?""",
+                    (
+                        observation.observed_at,
+                        observation.observed_at,
+                        json.dumps(quality_payload, ensure_ascii=False),
+                        observation.etag,
+                        observation.last_modified,
+                        identity_result.status,
+                        identity_result.confidence,
+                        "；".join(identity_result.reasons),
+                        json.dumps(identity_result.evidence, ensure_ascii=False),
+                        observation.observed_at,
+                        source_id,
+                    ),
+                )
+                semantic_hash = source["semantic_hash"]
+                record_timing(
+                    "limited_baseline_heartbeat_transition",
+                    transition_started,
+                )
+            elif not usable:
                 transition_started = perf_counter()
                 if identity_result.status in {"review", "conflict"}:
                     status = (

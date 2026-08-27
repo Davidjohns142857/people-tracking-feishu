@@ -46,6 +46,71 @@ def test_homepage_identity_only_shell_is_not_a_usable_baseline():
     assert usable is False
 
 
+def test_homepage_recovers_drupal_profile_fields_from_thin_official_page():
+    snapshot = generic(
+        """
+        <html><head><title>Serena Wang | Computer Science at UBC</title></head>
+        <body><main><h1>Serena Wang</h1>
+        <div class="field field__item"><h3>Assistant Professor</h3></div>
+        <div class="field field__label">Email</div>
+        <div class="field field__item"><a href="mailto:serena@example.edu">serena@example.edu</a></div>
+        <div class="field field__label"><h2>Research Areas</h2></div>
+        <div class="field field__item"><a href="/research/game-theory">Algorithmic Game Theory</a></div>
+        <div class="field field__item"><a href="/research/ml">Artificial Intelligence and Machine Learning</a></div>
+        </main></body></html>
+        """
+    )
+    score, reasons, usable = assess_snapshot(
+        snapshot,
+        expected_names=["Serena Wang"],
+        expected_url="https://www.cs.ubc.ca/people/serena-wang",
+        curated_binding=True,
+    )
+
+    assert snapshot.extractor_version == (
+        "semantic-manifest-v5-homepage-tolerant-blocks"
+    )
+    assert snapshot.item_count >= 4
+    assert snapshot.token_count >= 5
+    assert any("serena@example.edu" in item.text for item in snapshot.items)
+    assert any("Algorithmic Game Theory" in item.text for item in snapshot.items)
+    assert reasons == []
+    assert score == 1.0
+    assert usable is True
+
+
+def test_homepage_recovers_content_after_unclosed_generated_form():
+    snapshot = generic(
+        """
+        <html><head><title>郭彦良-中国人民大学物理学院</title></head><body>
+        <ul><li>输入关键词检索相关内容</li></ul>
+        <form name="_newscontent_fromname">
+        <h1>郭彦良</h1>
+        <p>郭彦良，中国人民大学副教授、博士生导师。</p>
+        <p>研究内容主要聚焦低维强关联多体体系与量子混沌。</p>
+        <p>2026年至今在中国人民大学物理学院任职。</p>
+        </form>
+        </body></html>
+        """
+    )
+    score, reasons, usable = assess_snapshot(
+        snapshot,
+        expected_names=["郭彦良"],
+        expected_url="http://www.phys.ruc.edu.cn/info/1119/2724.htm",
+        curated_binding=True,
+    )
+
+    assert snapshot.extractor_version == (
+        "semantic-manifest-v5-homepage-tolerant-blocks"
+    )
+    assert snapshot.item_count >= 3
+    assert snapshot.token_count >= 5
+    assert any("低维强关联多体体系" in item.text for item in snapshot.items)
+    assert reasons == []
+    assert score == 1.0
+    assert usable is True
+
+
 @pytest.mark.parametrize(
     ("before", "after", "expected"),
     [
@@ -233,6 +298,32 @@ def test_scholar_detects_title_edit_for_same_publication_id():
 def test_scholar_uses_dedicated_extractor_version():
     snapshot = extract_snapshot("scholar", scholar_html(citation=10))
     assert snapshot.extractor_version == "semantic-manifest-v5-scholar-recent100"
+
+
+def test_scholar_explicit_empty_profile_is_a_healthy_stable_state():
+    body = """
+    <div id="gsc_prf_in">Ruyi Xu</div>
+    <div id="gsc_prf_i">MIT</div>
+    <div id="gsc_prf_int">EE</div>
+    <table id="gsc_a_t"><tbody id="gsc_a_b">
+      <tr class="gsc_a_tr"><td class="gsc_a_e" colspan="3">
+        There are no articles in this profile.
+      </td></tr>
+    </tbody></table>
+    """
+    snapshot = extract_snapshot("scholar", body)
+    score, reasons, usable = assess_snapshot(
+        snapshot,
+        expected_names=["Ruyi Xu"],
+        expected_url="https://scholar.google.com/citations?user=9WSobjkAAAAJ",
+        curated_binding=True,
+    )
+
+    assert "empty-publication-table" in snapshot.sentinels
+    assert snapshot.item_count == 2
+    assert reasons == []
+    assert score == 1.0
+    assert usable is True
 
 
 def test_github_ignores_followers_but_detects_new_repository():
