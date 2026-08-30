@@ -43,6 +43,111 @@ def observe(tracker, source, body, *, status_code=200, etag=None, error=None):
     return run_id, decision
 
 
+def identity_only_linkedin_projection(*, headline: str = "Username: yihchun"):
+    return {
+        "canonical_url": "https://linkedin.com/in/yihchun",
+        "profile": {
+            "name": "Yih-Chun Hu",
+            "headline": headline,
+            "location": "Urbana, Illinois, United States (US)",
+            "summary": "Total Contributions: 13",
+        },
+        "sections": [],
+        "sentinels": ["search-index-exact-url", "profile-name"],
+    }
+
+
+def test_identical_limited_linkedin_baseline_is_a_safe_heartbeat(tmp_path):
+    tracker = LightTracker(tmp_path / "tracker.sqlite3")
+    person = tracker.add_person(
+        "Yih-Chun Hu",
+        urls=["https://www.linkedin.com/in/yihchun"],
+    )
+    source = person["sources"][0]
+    baseline = extract_snapshot(
+        "linkedin",
+        identity_only_linkedin_projection(),
+    )
+    baseline.retrieval_mode = "search_index"
+    tracker.db.execute(
+        """UPDATE sources SET snapshot_json=?,semantic_hash=?,
+           health_status='degraded',consecutive_failures=6
+           WHERE source_id=?""",
+        (baseline.to_json(), baseline.semantic_hash, source["source_id"]),
+    )
+    tracker.db.commit()
+
+    run_id = tracker.start_run("limited-heartbeat")
+    decision = tracker.observe(
+        run_id,
+        source["source_id"],
+        FetchObservation(
+            body=identity_only_linkedin_projection(),
+            final_url=source["url"],
+            retrieval_mode="search_index",
+        ),
+    )
+    tracker.complete_run(run_id)
+    state = tracker.db.execute(
+        """SELECT snapshot_json,semantic_hash,health_status,
+                  consecutive_failures,quality_json
+           FROM sources WHERE source_id=?""",
+        (source["source_id"],),
+    ).fetchone()
+
+    assert decision.status == "unchanged"
+    assert "不放宽人物变化确认门" in decision.summary
+    assert state["snapshot_json"] == baseline.to_json()
+    assert state["semantic_hash"] == baseline.semantic_hash
+    assert state["health_status"] == "healthy"
+    assert state["consecutive_failures"] == 0
+    assert json.loads(state["quality_json"])["limited_baseline_heartbeat"] is True
+    tracker.close()
+
+
+def test_changed_identity_only_linkedin_projection_remains_incomplete(tmp_path):
+    tracker = LightTracker(tmp_path / "tracker.sqlite3")
+    person = tracker.add_person(
+        "Yih-Chun Hu",
+        urls=["https://www.linkedin.com/in/yihchun"],
+    )
+    source = person["sources"][0]
+    baseline = extract_snapshot(
+        "linkedin",
+        identity_only_linkedin_projection(),
+    )
+    baseline.retrieval_mode = "search_index"
+    tracker.db.execute(
+        "UPDATE sources SET snapshot_json=?,semantic_hash=? WHERE source_id=?",
+        (baseline.to_json(), baseline.semantic_hash, source["source_id"]),
+    )
+    tracker.db.commit()
+
+    run_id = tracker.start_run("limited-heartbeat-change")
+    decision = tracker.observe(
+        run_id,
+        source["source_id"],
+        FetchObservation(
+            body=identity_only_linkedin_projection(
+                headline="Associate Professor at UIUC",
+            ),
+            final_url=source["url"],
+            retrieval_mode="search_index",
+        ),
+    )
+    tracker.complete_run(run_id)
+    state = tracker.db.execute(
+        "SELECT snapshot_json,semantic_hash,health_status FROM sources WHERE source_id=?",
+        (source["source_id"],),
+    ).fetchone()
+
+    assert decision.status == "source_issue_pending"
+    assert state["snapshot_json"] == baseline.to_json()
+    assert state["semantic_hash"] == baseline.semantic_hash
+    assert state["health_status"] == "degraded"
+    tracker.close()
+
+
 def test_transient_change_never_poisoned_confirmed_baseline(tmp_path):
     tracker, source = make_tracker(tmp_path)
     observe(tracker, source, BASE)
