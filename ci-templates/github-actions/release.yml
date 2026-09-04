@@ -16,7 +16,7 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - name: Check immutable version tag
+      - name: Check version tag matches VERSION
         run: test "${GITHUB_REF_NAME}" = "v$(cat VERSION)"
       - name: Install offline test dependencies
         run: |
@@ -37,7 +37,7 @@ jobs:
           python "unpack/people-tracking-feishu-${version}/verify_release.py"
           PYTHONPATH="unpack/people-tracking-feishu-${version}/runtime:unpack/people-tracking-feishu-${version}/vendor/wheels/pypinyin-0.55.0-py2.py3-none-any.whl" \
             python "unpack/people-tracking-feishu-${version}/offline_self_test.py"
-      - name: Publish immutable release assets
+      - name: Publish release assets
         env:
           GH_TOKEN: ${{ github.token }}
         run: |

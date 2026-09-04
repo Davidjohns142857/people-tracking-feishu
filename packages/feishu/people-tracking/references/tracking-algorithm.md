@@ -16,9 +16,14 @@
 
 人物以姓名 + 第二 ID 建档，用稳定主页 ID 交叉验证。中文、拼音、英文顺序和已确认 nickname 建立别名边；GitHub nickname 不要求与正式姓名逐字一致。冲突进入审核，不自动跨人合并。
 
-DeepSeek V4 Flash 只处理：
+OpenClaw 无人值守由隔离宿主 Agent 回合执行，不调用另配模型 API。所有通过解析、身份和完整性硬门且可能进入用户报告的紧凑差分都进入
+`people-tracking-agent-review-v1`，由当前执行本 Skill 的 Agent 使用自身 token 最终裁定。请求必须
+绑定事件、完整 `review_snapshot_id`、`request_id` 和 `evidence_hash`；回填只能选择
+`publish`、`suppress`、`defer`，不能
+修改原始 delta 或越过解析、身份、完整性硬门。
+审核积压按 `agent_review.batch_size` 拆成持久的精确快照；当前快照全部原子提交后才生成下一批。
+`defer` 表示当前证据不发布并保留审计，后续新证据会生成新事件重新裁定。
 
-- `ambiguous_review`：健康、身份匹配、质量 ≥0.70、已有基线、紧凑差分且来源为 Homepage/Scholar/LinkedIn；结果只作 advisory。
-- `confirmed_summary`：确定性算法已经 confirmed；模型只生成中文摘要，不得改状态、score、delta 或确认计数。
-
-禁止发送完整页面、Cookie、headers、key、内部路径或无关人物内容。预算按来源/人物/日调用与 token 原子扣减，失败关闭。
+确定性重要性规则在生成审核包前抑制纯 UI、排版、same→same、不可解释年份和年级自然递增；
+新增论文、明确录用、职位/单位变化和重要奖项只作为优先发布建议，仍须宿主 Agent 回填 `publish`
+决定后才能进入用户报告。禁止在请求中包含完整页面、Cookie、headers、secret、内部路径或无关人物内容。

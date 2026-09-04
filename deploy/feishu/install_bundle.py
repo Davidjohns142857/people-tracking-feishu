@@ -215,9 +215,17 @@ def dependency_report(args: argparse.Namespace, home: Path) -> dict[str, Any]:
     }
 
 
-def verify_release(root: Path) -> dict[str, Any]:
+def verify_release(
+    root: Path, *, trusted_verifier_root: Path | None = None
+) -> dict[str, Any]:
+    verifier_root = trusted_verifier_root or root
     result = subprocess.run(
-        [sys.executable, str(root / "verify_release.py"), "--root", str(root)],
+        [
+            sys.executable,
+            str(verifier_root / "verify_release.py"),
+            "--root",
+            str(root),
+        ],
         capture_output=True,
         text=True,
         timeout=60,
@@ -320,8 +328,89 @@ def _copy_tree(source: Path, destination: Path) -> None:
 
 
 def _backup_name(path: Path) -> Path:
-    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
     return path.with_name(f"{path.name}.backup-{stamp}")
+
+
+def _build_and_replace_private_venv(
+    *, venv: Path, selected_python: str, release: Path
+) -> Path | None:
+    """Build from a trusted interpreter without executing an existing venv.
+
+    Existing versioned venvs are untrusted mutable state.  They are renamed to a
+    quarantine path only after a complete replacement has passed dependency
+    checks; the installer never invokes their ``bin/python``.
+    """
+
+    venv.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    staging = Path(tempfile.mkdtemp(prefix=f".{venv.name}.", dir=venv.parent))
+    python_environment = {
+        key: value
+        for key, value in os.environ.items()
+        if not key.startswith(("PYTHON", "PIP_"))
+    }
+    python_environment["PYTHONNOUSERSITE"] = "1"
+    wheel = release / "vendor" / "wheels" / "pypinyin-0.55.0-py2.py3-none-any.whl"
+    if wheel.is_symlink() or not wheel.is_file():
+        raise RuntimeError("verified bundled pypinyin wheel is missing")
+    quarantine: Path | None = None
+    try:
+        subprocess.run(
+            [selected_python, "-m", "venv", str(staging)],
+            check=True,
+            timeout=120,
+            capture_output=True,
+            text=True,
+            env=python_environment,
+        )
+        staged_python = staging / "bin" / "python"
+        pip_environment = {**python_environment, "PIP_NO_INDEX": "1"}
+        subprocess.run(
+            [
+                str(staged_python),
+                "-m",
+                "pip",
+                "install",
+                "--isolated",
+                "--no-index",
+                "--no-deps",
+                "--disable-pip-version-check",
+                str(wheel),
+            ],
+            check=True,
+            timeout=120,
+            capture_output=True,
+            text=True,
+            env=pip_environment,
+        )
+        subprocess.run(
+            [
+                str(staged_python),
+                "-c",
+                "import pypinyin; assert pypinyin.__version__ == '0.55.0'",
+            ],
+            check=True,
+            timeout=30,
+            capture_output=True,
+            text=True,
+            env=pip_environment,
+        )
+        if os.path.lexists(venv):
+            quarantine = _backup_name(venv)
+            quarantine = quarantine.with_name(
+                quarantine.name.replace(".backup-", ".quarantine-", 1)
+            )
+            venv.rename(quarantine)
+        try:
+            staging.rename(venv)
+        except Exception:
+            if quarantine is not None and quarantine.exists() and not os.path.lexists(venv):
+                quarantine.rename(venv)
+            raise
+        return quarantine
+    finally:
+        if staging.exists():
+            shutil.rmtree(staging, ignore_errors=True)
 
 
 def _install_skill(source: Path, destination: Path) -> dict[str, Any]:
@@ -367,47 +456,32 @@ def _apply_install_unchecked(args: argparse.Namespace, root: Path, home: Path, p
             previous_state = json.loads(install_state_path.read_text(encoding="utf-8"))
         except json.JSONDecodeError:
             raise RuntimeError("existing install-state.json is invalid")
-    config.mkdir(parents=True, exist_ok=True, mode=0o700)
-    state.mkdir(parents=True, exist_ok=True, mode=0o700)
-    config.chmod(0o700)
-    state.chmod(0o700)
     if release.exists():
         installed_manifest = release / "release-manifest.json"
         if not installed_manifest.is_file() or sha256(installed_manifest) != sha256(root / "release-manifest.json"):
             raise RuntimeError("release destination already exists with different contents")
+        # Never execute the verifier from the already-installed tree: that is
+        # precisely the tree whose integrity is in question.  The incoming
+        # release was verified before apply and supplies the trusted verifier
+        # used to hash every installed file and reject extras/symlinks/caches.
+        verify_release(release, trusted_verifier_root=root)
     else:
         release.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         staging = release.with_name(f".{release.name}.{os.getpid()}.tmp")
         _copy_tree(root, staging)
         staging.rename(release)
-    if not venv.exists():
-        Path(venv).parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-        subprocess.run(
-            [preview["dependencies"]["python"]["selected"], "-m", "venv", str(venv)],
-            check=True,
-            timeout=120,
-            capture_output=True,
-            text=True,
-        )
-        pip = venv / "bin" / "python"
-        subprocess.run(
-            [
-                str(pip),
-                "-m",
-                "pip",
-                "install",
-                "--no-index",
-                "--disable-pip-version-check",
-                "--find-links",
-                str(release / "vendor" / "wheels"),
-                "pypinyin==0.55.0",
-            ],
-            check=True,
-            timeout=120,
-            capture_output=True,
-            text=True,
-            env={**os.environ, "PIP_NO_INDEX": "1"},
-        )
+    # Installed-tree verification is a precondition for all configuration/state
+    # mutations.  A pre-seeded corrupt release must fail with mutated=false and
+    # must not create or chmod unrelated runtime directories.
+    config.mkdir(parents=True, exist_ok=True, mode=0o700)
+    state.mkdir(parents=True, exist_ok=True, mode=0o700)
+    config.chmod(0o700)
+    state.chmod(0o700)
+    venv_quarantine = _build_and_replace_private_venv(
+        venv=venv,
+        selected_python=str(preview["dependencies"]["python"]["selected"]),
+        release=release,
+    )
     skills = [
         _install_skill(
             release / "packages" / "feishu" / "people-tracking",
@@ -432,8 +506,12 @@ def _apply_install_unchecked(args: argparse.Namespace, root: Path, home: Path, p
     launcher_changed = False
     launcher_content = (
         "#!/bin/sh\n"
+        "unset PYTHONHOME\n"
+        "export PYTHONDONTWRITEBYTECODE=1\n"
+        "export PYTHONNOUSERSITE=1\n"
+        "export PYTHONSAFEPATH=1\n"
         f"export PYTHONPATH={shlex.quote(str(release / 'runtime'))}\n"
-        f"exec {shlex.quote(str(venv / 'bin' / 'python'))} -m people_tracking_feishu.cli \"$@\"\n"
+        f"exec {shlex.quote(str(venv / 'bin' / 'python'))} -P -m people_tracking_feishu.cli \"$@\"\n"
     )
     if launcher.exists():
         current = launcher.read_text(encoding="utf-8")
@@ -463,6 +541,8 @@ def _apply_install_unchecked(args: argparse.Namespace, root: Path, home: Path, p
         "status": "installed",
         "release": str(release),
         "venv": str(venv),
+        "venv_quarantine": str(venv_quarantine) if venv_quarantine else None,
+        "venv_rebuilt_from_trusted_python": True,
         "launcher": str(launcher),
         "launcher_backup": str(launcher_backup) if launcher_backup else None,
         "launcher_changed": launcher_changed,
@@ -493,16 +573,38 @@ def _apply_install_unchecked(args: argparse.Namespace, root: Path, home: Path, p
     }
 
 
-def _path_snapshot(path: Path) -> dict[str, Any]:
+def _path_snapshot(path: Path, *, metadata_only: bool = False) -> dict[str, Any]:
+    if path.is_symlink():
+        return {
+            "exists": True,
+            "kind": "symlink",
+            "link_target": os.readlink(path),
+            "mode": stat.S_IMODE(path.lstat().st_mode),
+            "metadata_only": metadata_only,
+            "tree_hash": None,
+            "sha256": None,
+        }
     return {
         "exists": path.exists(),
-        "tree_hash": tree_hash(path) if path.is_dir() else None,
-        "sha256": sha256(path) if path.is_file() else None,
+        "kind": "directory" if path.is_dir() else "file" if path.is_file() else None,
+        "mode": stat.S_IMODE(path.stat().st_mode) if path.exists() else None,
+        "metadata_only": metadata_only,
+        "tree_hash": tree_hash(path) if path.is_dir() and not metadata_only else None,
+        "sha256": sha256(path) if path.is_file() and not metadata_only else None,
     }
 
 
 def _latest_backup(path: Path) -> Path | None:
     matches = sorted(path.parent.glob(f"{path.name}.backup-*")) if path.parent.exists() else []
+    return matches[-1] if matches else None
+
+
+def _latest_quarantine(path: Path) -> Path | None:
+    matches = (
+        sorted(path.parent.glob(f"{path.name}.quarantine-*"))
+        if path.parent.exists()
+        else []
+    )
     return matches[-1] if matches else None
 
 
@@ -533,8 +635,15 @@ def _failed_install_state(
     launcher_changed = _path_snapshot(launcher) != before[str(launcher)]
     if launcher_changed:
         mutations.append(str(launcher))
+    venv_changed = _path_snapshot(venv) != before[str(venv)]
     for target in (release, venv):
         if _path_snapshot(target) != before[str(target)]:
+            mutations.append(str(target))
+    for target in (
+        Path(preview["paths"]["config"]),
+        Path(preview["paths"]["state"]),
+    ):
+        if _path_snapshot(target, metadata_only=True) != before[str(target)]:
             mutations.append(str(target))
     return (
         {
@@ -544,6 +653,12 @@ def _failed_install_state(
             "status": "install_failed",
             "release": str(release),
             "venv": str(venv),
+            "venv_quarantine": (
+                str(_latest_quarantine(venv))
+                if before[str(venv)]["exists"] and _latest_quarantine(venv)
+                else None
+            ),
+            "venv_rebuilt_from_trusted_python": venv_changed,
             "launcher": str(launcher),
             "launcher_backup": (
                 str(_latest_backup(launcher)) if before[str(launcher)]["exists"] and _latest_backup(launcher) else None
@@ -567,18 +682,56 @@ def apply_install(args: argparse.Namespace, root: Path, home: Path, preview: dic
         *(Path(path) for path in preview["paths"]["skills"]),
     ]
     before = {str(path): _path_snapshot(path) for path in targets}
+    for path in (
+        Path(preview["paths"]["config"]),
+        Path(preview["paths"]["state"]),
+    ):
+        before[str(path)] = _path_snapshot(path, metadata_only=True)
     try:
         return _apply_install_unchecked(args, root, home, preview)
     except Exception as exc:
-        state, mutations = _failed_install_state(preview, before)
-        rollback_result = None
+        try:
+            state, mutations = _failed_install_state(preview, before)
+        except Exception as audit_exc:
+            raise InstallFailure(
+                f"{exc}; mutation audit failed: {audit_exc}",
+                mutated=True,
+                mutations=["mutation_audit_incomplete"],
+                rollback_result={
+                    "status": "failed",
+                    "error": f"mutation audit failed: {audit_exc}",
+                },
+            ) from exc
+        rollback_result: dict[str, Any] | None = None
         if mutations:
             install_state_path = Path(preview["paths"]["config"]) / "install-state.json"
-            secure_write(
-                install_state_path,
-                json.dumps(state, ensure_ascii=False, indent=2) + "\n",
-            )
-            rollback_result = rollback(home)
+            try:
+                secure_write(
+                    install_state_path,
+                    json.dumps(state, ensure_ascii=False, indent=2) + "\n",
+                )
+                if str(install_state_path) not in mutations:
+                    mutations.append(str(install_state_path))
+                config_path = Path(preview["paths"]["config"])
+                if (
+                    _path_snapshot(config_path, metadata_only=True)
+                    != before[str(config_path)]
+                    and str(config_path) not in mutations
+                ):
+                    mutations.append(str(config_path))
+            except Exception as state_exc:
+                rollback_result = {
+                    "status": "failed",
+                    "error": f"failed to persist rollback state: {state_exc}",
+                }
+            else:
+                try:
+                    rollback_result = rollback(home)
+                except Exception as rollback_exc:
+                    rollback_result = {
+                        "status": "failed",
+                        "error": f"automatic rollback failed: {rollback_exc}",
+                    }
         raise InstallFailure(
             str(exc),
             mutated=bool(mutations),
@@ -639,7 +792,17 @@ def rollback(home: Path) -> dict[str, Any]:
         "actions": actions,
         "install_state": str(path),
         "rollback": rollback_record,
-        "preserved": [state.get("release"), state.get("venv"), str(path.parent), str(home / ".local/state/people-tracking-feishu")],
+        "preserved": [
+            value
+            for value in (
+                state.get("release"),
+                state.get("venv"),
+                state.get("venv_quarantine"),
+                str(path.parent),
+                str(home / ".local/state/people-tracking-feishu"),
+            )
+            if value
+        ],
         "deleted": [],
         "scheduled_jobs_note": "Schedules are registered only after onboarding confirmation and require their own explicit removal.",
     }

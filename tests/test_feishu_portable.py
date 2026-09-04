@@ -106,7 +106,9 @@ elif '+fetch' in args and args[0]=='docs': data={'title':'[TEST] report','markdo
 elif '+messages-send' in args: data={'message_id':'om_test'}
 elif '+base-get' in args: data={'name':'Synthetic Base'}
 elif '+table-list' in args: data={'items':[{'table_id':'tbl_people','name':'People'}]}
-elif '+field-list' in args: data={'items':[{'field_id':'fld_name','field_name':'Name'}]}
+elif '+field-list' in args:
+    table=args[args.index('--table-id')+1]
+    data={'items':([{'field_id':'fld_url','field_name':'URL'}] if table=='tbl_sources' else [{'field_id':'fld_name','field_name':'Name'}])}
 elif '+node-get' in args: data={'obj_type':'bitable','obj_token':'bas_test'}
 print(json.dumps({'ok':True,'dry_run':dry,'data':data},ensure_ascii=False))
 """,
@@ -116,11 +118,96 @@ print(json.dumps({'ok':True,'dry_run':dry,'data':data},ensure_ascii=False))
     return script, log
 
 
+def _contract_hash(value: object) -> str:
+    encoded = json.dumps(
+        value,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    )
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
+def _strict_master_bridge_payload(
+    request: dict,
+    *,
+    base_token: str,
+    base_url: str,
+    table_ids: dict[str, str],
+) -> dict:
+    outcomes: list[dict] = []
+    for index, (ref, contract) in enumerate(request["expected_writes"].items(), 1):
+        table, entity_key = ref.split(":", 1)
+        record_id = contract.get("target_record_id") or f"rec_bridge_{index}"
+        applied_mapping = {
+            semantic: candidates[0]
+            for semantic, candidates in contract["machine_field_candidates"].items()
+        }
+        created_mapping = {
+            semantic: contract["human_field_candidates"][semantic][0]
+            for semantic in contract["create_human_fields"]
+        }
+        post_fields = dict(contract["expected_before_fields"]["fields"])
+        for semantic, desired in contract["machine_patch"].items():
+            post_fields[applied_mapping[semantic]] = desired
+        for semantic, desired in contract["create_human_fields"].items():
+            post_fields[created_mapping[semantic]] = desired
+        post_read = {"record_id": record_id, "fields": post_fields}
+        outcomes.append(
+            {
+                "table": table,
+                "entity_key": entity_key,
+                "record_id": record_id,
+                "operation": contract["operation"],
+                "target_record_id": contract["target_record_id"],
+                "contract_hash": contract["contract_hash"],
+                "machine_patch_hash": contract["machine_patch_hash"],
+                "expected_before_hash": contract["expected_before_hash"],
+                "preflight_ok": True,
+                "before_read": contract["expected_before_fields"],
+                "applied_patch": contract["machine_patch"],
+                "applied_field_mapping": applied_mapping,
+                "human_patch": {},
+                "created_human_fields": contract["create_human_fields"],
+                "created_field_mapping": created_mapping,
+                "post_read": post_read,
+                "post_read_hash": _contract_hash(post_read),
+                "human_fields_unchanged": True,
+                "ok": True,
+            }
+        )
+    return {
+        "schema_version": request["schema_version"],
+        "purpose": "master_sync",
+        "all_ok": True,
+        "write_protocol": "machine-fields-verified-v1",
+        "preflight_all_ok": True,
+        "bridge_nonce": request["bridge_nonce"],
+        "expected_refs": request["expected_refs"],
+        "expected_refs_hash": request["expected_refs_hash"],
+        "request_hash": request["request_hash"],
+        "completed_refs": request["expected_refs"],
+        "base_token": base_token,
+        "base_url": base_url,
+        "table_ids": table_ids,
+        "schema_fields": {
+            "People": ["Name", "Person Key", "Record Type"],
+            **(
+                {"Sources": ["URL", "Source Key"]}
+                if "Sources" in table_ids
+                else {}
+            ),
+        },
+        "outcomes": outcomes,
+    }
+
+
 def test_config_rejects_inline_secret(tmp_path: Path):
     payload = normalize_answers(answers(tmp_path / "people.md"))
-    payload["apis"]["deepseek"].update(
-        {"enabled": True, "key_reference": "sk-" + "123456789012345678901234"}
-    )
+    payload["apis"]["search"] = [
+        {"name": "synthetic", "secret_reference": "sk-" + "123456789012345678901234"}
+    ]
     with pytest.raises(ConfigError, match="inline secret"):
         validate_config(payload)
 
@@ -230,7 +317,7 @@ def test_lark_cli_enforces_dry_run_and_pagination(tmp_path: Path, monkeypatch: p
     assert not (tmp_path / "touch_should_not_run").exists()
 
 
-def test_digest_is_idempotent_after_document_and_message(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+def test_empty_public_digest_is_idempotent_without_feishu_noise(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     executable, log = fake_lark_cli(tmp_path)
     monkeypatch.setenv("FAKE_LARK_LOG", str(log))
     source = tmp_path / "people.md"
@@ -261,10 +348,9 @@ def test_digest_is_idempotent_after_document_and_message(tmp_path: Path, monkeyp
         first = deliver_digest(state, paths, config, output_kind="daily", tracker_run_id=run_id, apply=True, lark=lark)
         second = deliver_digest(state, paths, config, output_kind="daily", tracker_run_id=run_id, apply=True, lark=lark)
         assert first["delivery"]["status"] == "completed"
+        assert first["empty_public_report_suppressed"] is True
         assert second["idempotent_replay"] is True
-        calls = [json.loads(line) for line in log.read_text(encoding="utf-8").splitlines()]
-        assert sum("+create" in call and call[0] == "docs" for call in calls) == 2
-        assert sum("+messages-send" in call for call in calls) == 2
+        assert not log.exists()
     finally:
         state.close()
 
@@ -730,20 +816,21 @@ def test_bootstrap_resumes_source_and_master_feishu_bridges(
     )
     assert master_wait["status"] == "waiting_for_master_bridge"
     master_request = master_wait["actions"][0]
+    state = PortableState(paths.database)
+    try:
+        full_master_request = state.get_meta("bridge_request:master_sync")
+    finally:
+        state.close()
+    assert full_master_request["bridge_nonce"] == master_request["bridge_nonce"]
     master_result = tmp_path / "master-result.json"
     secure_write_json(
         master_result,
-        {
-            "all_ok": True,
-            "bridge_nonce": master_request["bridge_nonce"],
-            "expected_refs": master_request["expected_refs"],
-            "expected_refs_hash": master_request["expected_refs_hash"],
-            "request_hash": master_request["request_hash"],
-            "completed_refs": master_request["expected_refs"],
-            "base_token": "bas_synthetic",
-            "base_url": "https://synthetic.feishu.cn/base/bas_synthetic",
-            "table_ids": {"People": "tbl_people", "Sources": "tbl_sources"},
-        },
+        _strict_master_bridge_payload(
+            full_master_request,
+            base_token="bas_synthetic",
+            base_url="https://synthetic.feishu.cn/base/bas_synthetic",
+            table_ids={"People": "tbl_people", "Sources": "tbl_sources"},
+        ),
     )
     monkeypatch.setattr(
         tracking_module,
@@ -785,11 +872,77 @@ def test_release_builder_and_verifier(tmp_path: Path):
     assert hashlib.sha256(archive.read_bytes()).hexdigest() == payload["sha256"]
     with zipfile.ZipFile(archive) as handle:
         names = handle.namelist()
-        assert any(name.endswith("/release-manifest.json") for name in names)
+        manifest_name = next(
+            name for name in names if name.endswith("/release-manifest.json")
+        )
+        manifest = json.loads(handle.read(manifest_name).decode("utf-8"))
+        assert manifest["agent_review_policy"] == {
+            "mode": "execution_agent",
+            "decision_authority": "skill_host_agent",
+            "external_model_api": False,
+            "compact_evidence_only": True,
+            "review_schema": "people-tracking-agent-review-v1",
+        }
+        assert manifest["source_snapshot_policy"] == {
+            "portable_launcher_imports_full_source": False,
+            "portable_installer_installs_optional_model_extras": False,
+            "full_source_contains_optional_people_intel_cognee_integration": True,
+        }
         assert any(name.endswith("/INSTALL_PROMPT.md") for name in names)
         assert any(name.endswith("/runtime/people_tracking_feishu/cli.py") for name in names)
+        assert any(
+            name.endswith("/full-source/src/people_tracking_feishu/reporting.py")
+            for name in names
+        )
+        lock_name = next(
+            name for name in names if name.endswith("/full-source/requirements.openclaw.lock")
+        )
+        assert "pypinyin==0.55.0" in handle.read(lock_name).decode("utf-8")
         assert any(name.endswith("/vendor/wheels/pypinyin-0.55.0-py2.py3-none-any.whl") for name in names)
+        assert not any(name.endswith("/deepseek_fallback.py") for name in names)
         assert not any("/artifacts/" in name or "/inputs/" in name for name in names)
+
+
+def test_release_verifier_flags_deepseek_runtime_signature(tmp_path: Path):
+    build = subprocess.run(
+        [
+            sys.executable,
+            str(ROOT / "scripts/build_feishu_release.py"),
+            "--output-dir",
+            str(tmp_path),
+        ],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    archive = Path(json.loads(build.stdout)["archive"])
+    extract = tmp_path / "tampered"
+    with zipfile.ZipFile(archive) as handle:
+        handle.extractall(extract)
+    release = extract / f"people-tracking-feishu-{RELEASE_VERSION}"
+    target = release / "runtime" / "people_tracking_feishu" / "reporting.py"
+    target.write_text(
+        target.read_text(encoding="utf-8") + "\n# https://api.deepseek.com\n",
+        encoding="utf-8",
+    )
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(release / "verify_release.py"),
+            "--root",
+            str(release),
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 2
+    report = json.loads(result.stdout)
+    assert report["ok"] is False
+    assert any(
+        item.endswith("reporting.py:deepseek_endpoint")
+        for item in report["scan"]["deepseek_runtime"]
+    )
 
 
 def test_install_dry_run_does_not_modify_home(tmp_path: Path):
@@ -830,7 +983,7 @@ def test_install_dry_run_does_not_modify_home(tmp_path: Path):
     assert hashlib.sha256(sentinel.read_bytes()).hexdigest() == before
 
 
-def test_release_verification_ignores_only_derived_python_bytecode(tmp_path: Path):
+def test_release_verification_rejects_unmanifested_python_bytecode(tmp_path: Path):
     build = subprocess.run(
         [sys.executable, str(ROOT / "scripts/build_feishu_release.py"), "--output-dir", str(tmp_path)],
         capture_output=True,
@@ -851,8 +1004,12 @@ def test_release_verification_ignores_only_derived_python_bytecode(tmp_path: Pat
         text=True,
         check=False,
     )
-    assert verify.returncode == 0, verify.stdout + verify.stderr
-    assert json.loads(verify.stdout)["ok"] is True
+    assert verify.returncode == 2, verify.stdout + verify.stderr
+    report = json.loads(verify.stdout)
+    relative = "runtime/people_tracking_feishu/__pycache__/cli.cpython-312.pyc"
+    assert report["ok"] is False
+    assert relative in report["extra"]
+    assert relative in report["scan"]["forbidden"]
 
 
 def test_install_apply_repeat_and_rollback_preserve_existing_files(tmp_path: Path):
@@ -890,6 +1047,7 @@ def test_install_apply_repeat_and_rollback_preserve_existing_files(tmp_path: Pat
     node.write_text("#!/bin/sh\necho v24.1.0\n", encoding="utf-8")
     node.chmod(0o755)
     environment = {**os.environ, "PATH": f"{fakebin}:{os.environ.get('PATH','')}", "FAKE_LARK_LOG": str(tmp_path / "install-lark.jsonl")}
+    environment.pop("PYTHONDONTWRITEBYTECODE", None)
     command = [
         sys.executable,
         str(release / "install_bundle.py"),
@@ -916,11 +1074,90 @@ def test_install_apply_repeat_and_rollback_preserve_existing_files(tmp_path: Pat
         / RELEASE_VERSION
         / "bin/python"
     ).is_file()
+    shadow_root = tmp_path / "cwd-shadow"
+    shadow_package = shadow_root / "people_tracking_feishu"
+    shadow_package.mkdir(parents=True)
+    (shadow_package / "__init__.py").write_text("", encoding="utf-8")
+    shadow_marker = tmp_path / "cwd-shadow-executed"
+    (shadow_package / "cli.py").write_text(
+        "from pathlib import Path\n"
+        f"Path({str(shadow_marker)!r}).write_text('executed')\n"
+        "raise SystemExit(97)\n",
+        encoding="utf-8",
+    )
+    shadow_probe = subprocess.run(
+        [str(launcher), "doctor", "--json"],
+        cwd=shadow_root,
+        capture_output=True,
+        text=True,
+        env=environment,
+        check=False,
+        timeout=60,
+    )
+    assert shadow_probe.returncode == 0, shadow_probe.stderr
+    assert json.loads(shadow_probe.stdout)["ok"] is True
+    assert not shadow_marker.exists()
     second = subprocess.run(command, capture_output=True, text=True, env=environment, check=True, timeout=180)
     # ``changed`` is ownership state for rollback, not merely this invocation's
     # copy count. A repeated install carries the original backup and therefore
     # remains explicitly rollback-owned.
     assert json.loads(second.stdout)["result"]["state"]["skills"][0]["changed"] is True
+    installed_release = (
+        home
+        / ".local/share/people-tracking-feishu/releases"
+        / RELEASE_VERSION
+    )
+    installed_runtime = (
+        installed_release / "runtime/people_tracking_feishu/reporting.py"
+    )
+    pristine_runtime = release / "runtime/people_tracking_feishu/reporting.py"
+    installed_runtime.write_text(
+        installed_runtime.read_text(encoding="utf-8") + "\n# tampered installed runtime\n",
+        encoding="utf-8",
+    )
+    refused_tampered_reinstall = subprocess.run(
+        command,
+        capture_output=True,
+        text=True,
+        env=environment,
+        check=False,
+        timeout=180,
+    )
+    assert refused_tampered_reinstall.returncode == 2
+    refused_payload = json.loads(refused_tampered_reinstall.stderr)
+    assert refused_payload["mutated"] is False
+    assert "release verification failed" in refused_payload["error"]["message"]
+    installed_runtime.write_bytes(pristine_runtime.read_bytes())
+    execution_marker = tmp_path / "untrusted-venv-python-executed"
+    installed_python = (
+        home
+        / ".local/state/people-tracking-feishu/venvs"
+        / RELEASE_VERSION
+        / "bin/python"
+    )
+    installed_python.unlink()
+    installed_python.write_text(
+        "#!/bin/sh\n"
+        f"touch {execution_marker}\n"
+        "exit 0\n",
+        encoding="utf-8",
+    )
+    installed_python.chmod(0o755)
+    safe_reinstall = subprocess.run(
+        command,
+        capture_output=True,
+        text=True,
+        env=environment,
+        check=False,
+        timeout=180,
+    )
+    assert safe_reinstall.returncode == 0, safe_reinstall.stderr
+    assert not execution_marker.exists()
+    subprocess.run(
+        [str(installed_python), "-c", "import pypinyin"],
+        check=True,
+        timeout=30,
+    )
     rolled = subprocess.run(
         [sys.executable, str(release / "install_bundle.py"), "--rollback", "--home", str(home)],
         capture_output=True,
@@ -931,6 +1168,7 @@ def test_install_apply_repeat_and_rollback_preserve_existing_files(tmp_path: Pat
     assert json.loads(rolled.stdout)["rolled_back"] is True
     assert (existing_skill / "SKILL.md").read_text(encoding="utf-8") == "old-skill\n"
     assert "old-launcher" in launcher.read_text(encoding="utf-8")
+    assert installed_python.exists()
     assert hashlib.sha256(settings.read_bytes()).hexdigest() == settings_hash
     replay = subprocess.run(
         [sys.executable, str(release / "install_bundle.py"), "--rollback", "--home", str(home)],
@@ -980,6 +1218,59 @@ def test_install_failure_reports_mutation_rolls_back_and_consumes_state(
     assert state["rollback"]["status"] == "completed"
     replay = module.rollback(home)
     assert replay["idempotent_replay"] is True
+
+
+def test_preseeded_tampered_release_fails_before_config_or_state_mutation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module_path = ROOT / "deploy/feishu/install_bundle.py"
+    spec = importlib.util.spec_from_file_location(
+        "portable_install_preseed_test", module_path,
+    )
+    assert spec and spec.loader
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+
+    home = tmp_path / "preseed-home"
+    incoming = tmp_path / "incoming-release"
+    incoming.mkdir()
+    manifest = incoming / "release-manifest.json"
+    manifest.write_text('{"synthetic": true}\n', encoding="utf-8")
+    release = home / ".local/share/people-tracking-feishu/releases/test"
+    release.mkdir(parents=True)
+    (release / "release-manifest.json").write_bytes(manifest.read_bytes())
+    (release / "runtime.py").write_text("# tampered\n", encoding="utf-8")
+    config = home / ".config/people-tracking-feishu"
+    state = home / ".local/state/people-tracking-feishu"
+    preview = {
+        "ready_to_apply": True,
+        "runtime_mode": "claude_lark_cli",
+        "dependencies": {"python": {"selected": sys.executable}},
+        "paths": {
+            "release": str(release),
+            "config": str(config),
+            "state": str(state),
+            "venv": str(state / "venvs/test"),
+            "launcher": str(home / ".local/bin/people-tracking-feishu"),
+            "skills": [],
+        },
+    }
+    monkeypatch.setattr(module, "offline_self_test", lambda *args: {"ok": True})
+
+    def reject_installed_tree(target, *, trusted_verifier_root=None):
+        assert target == release
+        assert trusted_verifier_root == incoming
+        raise RuntimeError("release verification failed")
+
+    monkeypatch.setattr(module, "verify_release", reject_installed_tree)
+    with pytest.raises(module.InstallFailure) as raised:
+        module.apply_install(argparse.Namespace(), incoming, home, preview)
+
+    assert raised.value.mutated is False
+    assert raised.value.mutations == []
+    assert not config.exists()
+    assert not state.exists()
 
 
 def test_failed_install_rollback_never_touches_unchanged_skill_with_old_backup(
@@ -1466,7 +1757,7 @@ def test_strict_scan_rejects_zero_enabled_zero_observed_and_cli_surfaces_failure
     assert payload["error"]["type"] == "ScanValidationFailed"
 
 
-def test_schedule_tick_consumes_hourly_cadence_and_queues_visible_master(
+def test_schedule_tick_reconciles_roster_then_scans_due_sources(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ):
@@ -1508,14 +1799,16 @@ def test_schedule_tick_consumes_hourly_cadence_and_queues_visible_master(
     )
     monkeypatch.setattr(cli_module, "_digest_due_now", lambda *args, **kwargs: False)
     result = command_schedule_tick(argparse.Namespace(lark_cli=None), paths)
-    assert scans == [True]
-    assert [item["operation"] for item in result["actions"]] == [
-        "scan",
-        "sync_visible_master",
-    ]
-    master = result["actions"][1]["result"]
-    assert master["operation"] == "sync_existing_master_base"
-    assert master["expected_refs"] == ["table:People", "table:Sources"]
+    assert scans == []
+    assert result["roster_bridge_waiting"] is True
+    assert result["public_delivery_blocked"] is True
+    reconcile = next(
+        item["result"]
+        for item in result["actions"]
+        if item["operation"] == "reconcile_roster" and "result" in item
+    )
+    assert reconcile["apply"] is False
+    assert reconcile["authoritative_roster_pending"] is True
 
 
 def test_scan_cli_returns_nonzero_and_false_envelope_when_validation_fails(
@@ -1548,7 +1841,7 @@ def test_scan_cli_returns_nonzero_and_false_envelope_when_validation_fails(
     assert payload["data"]["run_id"] == "run_synthetic"
 
 
-def test_bootstrap_does_not_become_ready_when_baseline_validation_fails(
+def test_bootstrap_keeps_repair_schedule_when_baseline_is_degraded(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ):
@@ -1587,9 +1880,10 @@ def test_bootstrap_does_not_become_ready_when_baseline_validation_fails(
         },
     )
     result = command_bootstrap(_bootstrap_args(), paths)
-    assert result["status"] == "baseline_validation_failed"
+    assert result["status"] == "ready"
     assert result["baseline"]["validation"]["passed"] is False
-    assert "scheduling was not enabled" in result["next"]
+    assert result["baseline_degraded"] is True
+    assert "retry automatically" in result["next"]
 
 
 @pytest.mark.parametrize(

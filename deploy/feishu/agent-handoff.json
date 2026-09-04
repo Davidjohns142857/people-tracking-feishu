@@ -2,17 +2,57 @@
   "schema_version": "people-tracking-feishu-handoff-v1",
   "release": "@@VERSION@@",
   "first_read": "AGENT_START_HERE.md",
+  "artifact_trust_policy": {
+    "required_sibling_assets": [
+      "people-tracking-feishu-@@VERSION@@.zip",
+      "people-tracking-feishu-@@VERSION@@.zip.sha256"
+    ],
+    "checksum_algorithm": "SHA-256",
+    "linux_checksum_command": [
+      "sha256sum",
+      "-c",
+      "people-tracking-feishu-@@VERSION@@.zip.sha256"
+    ],
+    "macos_checksum_command": [
+      "shasum",
+      "-a",
+      "256",
+      "-c",
+      "people-tracking-feishu-@@VERSION@@.zip.sha256"
+    ],
+    "checksum_required_before_extraction": true,
+    "package_code_must_not_execute_before_checksum": true,
+    "post_checksum_order": [
+      "extract_archive",
+      "verify_release",
+      "doctor",
+      "dry_run",
+      "apply"
+    ],
+    "checksum_authenticates_publisher": false,
+    "independent_attestation_included": false,
+    "trust_root": "GitHub HTTPS, repository release permissions, and maintainer tag/Release discipline"
+  },
   "entrypoints": {
     "verify": ["python3", "verify_release.py"],
     "doctor": ["python3", "install_bundle.py", "--doctor"],
     "dry_run": ["python3", "install_bundle.py", "--dry-run"],
     "apply": ["python3", "install_bundle.py", "--apply"],
     "onboarding": ["people-tracking-feishu", "onboarding", "--json"],
-    "bootstrap": ["people-tracking-feishu", "bootstrap", "--confirmation", "确认启用", "--json"]
+    "bootstrap": ["people-tracking-feishu", "bootstrap", "--confirmation", "确认启用", "--json"],
+    "review_export": ["people-tracking-feishu", "review-export", "--output", "REVIEW_REQUESTS.json", "--json"],
+    "review_apply": ["people-tracking-feishu", "review-apply", "--input", "REVIEW_DECISIONS.json", "--json"]
+  },
+  "runtime_contract": {
+    "authoritative_roster": "existing Feishu People Base; read the complete unfiltered table before every tick",
+    "roster_failure_policy": "fail closed: do not scan stale SQLite or publish reports",
+    "schema_policy": "discover live field metadata; add only missing machine-owned fields; never rename, delete, or overwrite human-owned fields",
+    "review_policy": "every potentially public change requires the current host Agent's bound publish/suppress/defer decision",
+    "report_policy": "public output contains concrete material people changes only; diagnostics go to the separate developer document",
+    "scholar_policy": "fixed weekly phase plus per-run/day/week budgets, persistent 429 circuit, and half-open canary"
   },
   "confirmation_phrases": {
     "enable": "确认启用",
-    "deepseek_smoke": "确认运行DeepSeek烟测",
     "sandbox_e2e": "确认运行私有沙箱E2E",
     "cleanup": "确认清理测试对象"
   },
@@ -21,6 +61,9 @@
     "modify_existing_agent_or_feishu_configuration",
     "network_install_dependencies_without_confirmation",
     "import_or_schedule_before_enable_confirmation",
-    "claim_real_e2e_without_readback_evidence"
+    "claim_real_e2e_without_readback_evidence",
+    "call_deepseek_or_external_review_model",
+    "send_parser_or_coverage_failures_to_public_report",
+    "full_rescan_after_ordinary_roster_edit"
   ]
 }

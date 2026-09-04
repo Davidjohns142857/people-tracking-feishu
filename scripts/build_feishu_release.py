@@ -27,11 +27,22 @@ PINNED_NPM_INTEGRITY = (
 )
 SKIP_NAMES = {"__pycache__", ".DS_Store"}
 FORBIDDEN_SUFFIXES = {".pyc", ".pyo", ".sqlite", ".sqlite3", ".db"}
+# Content inspection is deliberately all-or-nothing.  Rejecting an unusually
+# large staged file is safer than silently hashing it while skipping the secret
+# and local-path scans.  Legitimate v0.9 assets are far below this bound.
+MAX_AUDITED_FILE_BYTES = 8 * 1024 * 1024
 SECRET_PATTERNS = [
     re.compile(rb"\bsk-[A-Za-z0-9]{24,}\b"),
     re.compile(rb"(?i)authorization\s*[:=]\s*bearer\s+[A-Za-z0-9._~+/=-]{16,}"),
     re.compile(rb"-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----"),
 ]
+FORBIDDEN_DEEPSEEK_RUNTIME_PATTERNS = {
+    "deepseek_endpoint": re.compile(rb"(?i)api\.deepseek\.com"),
+    "deepseek_environment": re.compile(rb"PEOPLE_INTEL_DEEPSEEK_"),
+    "deepseek_enable_flag": re.compile(rb"(?<!no-)--deepseek(?:[\s\"'])"),
+    "deepseek_runtime_module": re.compile(rb"(?i)deepseek_fallback"),
+    "deepseek_runtime_reviewer": re.compile(rb"(?i)DeepSeek(?:Diff)?Reviewer"),
+}
 LOCAL_PATH = re.compile(rb"/(?:Users|home)/[A-Za-z0-9._-]+/")
 
 
@@ -78,9 +89,13 @@ def stage_release(staging: Path) -> None:
     (runtime_people_intel / "__init__.py").write_text(
         '"""Minimal portable People Intel tracking runtime."""\n', encoding="utf-8"
     )
-    for name in ("light_tracker.py", "light_cli.py", "deepseek_fallback.py"):
+    for name in ("light_tracker.py", "light_cli.py"):
         _copy_file(ROOT / "src" / "people_intel" / name, runtime_people_intel / name)
     _copy_tree(ROOT / "src" / "people_intel", staging / "full-source" / "src" / "people_intel")
+    _copy_tree(
+        ROOT / "src" / "people_tracking_feishu",
+        staging / "full-source" / "src" / "people_tracking_feishu",
+    )
     for name in ("pyproject.toml", "requirements.openclaw.lock"):
         _copy_file(ROOT / name, staging / "full-source" / name)
     for relative in ("db/schema.sql", "ontology/people-intel-v1.json"):
@@ -139,12 +154,20 @@ def audit(staging: Path) -> dict[str, str]:
         if any(part in SKIP_NAMES for part in path.parts) or path.suffix.casefold() in FORBIDDEN_SUFFIXES:
             failures.append(f"forbidden:{relative}")
             continue
+        if path.stat().st_size > MAX_AUDITED_FILE_BYTES:
+            failures.append(
+                f"oversized:{relative}:{path.stat().st_size}>{MAX_AUDITED_FILE_BYTES}"
+            )
+            continue
         data = path.read_bytes()
-        if len(data) <= 8 * 1024 * 1024:
-            if any(pattern.search(data) for pattern in SECRET_PATTERNS):
-                failures.append(f"secret:{relative}")
-            if LOCAL_PATH.search(data):
-                failures.append(f"local_path:{relative}")
+        if any(pattern.search(data) for pattern in SECRET_PATTERNS):
+            failures.append(f"secret:{relative}")
+        if relative.startswith(("runtime/", "full-source/src/")):
+            for name, pattern in FORBIDDEN_DEEPSEEK_RUNTIME_PATTERNS.items():
+                if pattern.search(data):
+                    failures.append(f"deepseek_runtime:{relative}:{name}")
+        if LOCAL_PATH.search(data):
+            failures.append(f"local_path:{relative}")
         files[relative] = hash_file(path)
     if failures:
         raise RuntimeError("release audit failed: " + ", ".join(failures))
@@ -221,13 +244,30 @@ def manifest(staging: Path, files: dict[str, str], epoch: int) -> dict[str, Any]
             "local_absolute_paths_included": False,
             "synthetic_test_data_only": True,
         },
-        "deepseek_policy": {
-            "default_enabled": False,
-            "model": "deepseek-v4-flash",
-            "eligible_use_cases": ["ambiguous_review", "confirmed_summary"],
-            "full_pages_sent": False,
-            "key_transport": "mode-0600-file-or-secret-reference",
-            "real_smoke_requires_confirmation": True,
+        "agent_review_policy": {
+            "mode": "execution_agent",
+            "decision_authority": "skill_host_agent",
+            "external_model_api": False,
+            "compact_evidence_only": True,
+            "review_schema": "people-tracking-agent-review-v1",
+        },
+        "source_snapshot_policy": {
+            "portable_launcher_imports_full_source": False,
+            "portable_installer_installs_optional_model_extras": False,
+            "full_source_contains_optional_people_intel_cognee_integration": True,
+        },
+        "release_audit_policy": {
+            "content_scan_is_mandatory": True,
+            "maximum_regular_file_bytes": MAX_AUDITED_FILE_BYTES,
+            "oversized_file_action": "reject",
+        },
+        "artifact_trust_policy": {
+            "checksum_algorithm": "sha256",
+            "checksum_required_before_extraction": True,
+            "checksum_asset_suffix": ".zip.sha256",
+            "checksum_authenticates_publisher": False,
+            "independent_attestation_included": False,
+            "trust_root": "GitHub Releases HTTPS, repository access controls, and immutable tag discipline",
         },
         "install_policy": {
             "global_editable_pip": False,
@@ -257,10 +297,13 @@ def main() -> int:
         render_release_metadata(staging)
         files = audit(staging)
         release_manifest = manifest(staging, files, args.source_date_epoch)
-        (staging / "release-manifest.json").write_text(
+        manifest_path = staging / "release-manifest.json"
+        manifest_path.write_text(
             json.dumps(release_manifest, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
             encoding="utf-8",
         )
+        if manifest_path.stat().st_size > MAX_AUDITED_FILE_BYTES:
+            raise RuntimeError("generated release manifest exceeds the safe verification size limit")
         normalize_metadata(staging, args.source_date_epoch)
         archive = args.output_dir / f"{staging.name}.zip"
         build_zip(staging, archive, args.source_date_epoch)

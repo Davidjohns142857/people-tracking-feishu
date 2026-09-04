@@ -56,5 +56,6 @@ python3 scripts/skill_entry.py scan --force-all --force-full-fetch \
 
 验收同时检查：全部已启用 Homepage 已计划且已观察；正文抓取 planned 与 attempted 一致；
 失败按 blocked、gone、rate_limited、transport_error、degraded、binding review/conflict 分类；错误率
-不超过门限；失败来源的旧 baseline 未改变；首次成功只标 baseline。任一项不满足时停止成功投递，
-先修正来源或保留为公开访问受限。
+不超过门限；失败来源的旧 baseline 未改变；首次成功只标 baseline。任一项不满足时不得宣称
+“严格复扫成功”，并把诊断写入开发者报告；这不阻断同一窗口内其他来源已确认的人员事实进入
+用户报告。

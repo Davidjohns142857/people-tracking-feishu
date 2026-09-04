@@ -10,8 +10,7 @@
     {
       "kind": "feishu_base",
       "url": "https://example.feishu.cn/base/BASE_TOKEN",
-      "table_name": "People",
-      "view_name": "Active"
+      "table_name": "People"
     }
   ],
   "source_routes": [
@@ -29,16 +28,25 @@
     }
   ],
   "field_mapping": {
+    "person_key": "人员编号",
+    "record_type": "记录类型",
     "name": "姓名",
     "secondary_id": "第二ID",
     "aliases": "别名",
     "school": "学校",
     "research_focus": "专业/研究方向",
     "stage": "阶段/年龄",
+    "employment_status": "任职状态",
     "homepage": "个人主页",
     "scholar": "Google Scholar",
     "github": "GitHub",
-    "linkedin": "LinkedIn"
+    "linkedin": "LinkedIn",
+    "sync_status": "同步状态",
+    "tracking_status": "跟踪状态",
+    "review_status": "审核状态",
+    "review_detail": "待确认信息",
+    "review_decision": "审核决定",
+    "managed_by": "管理方式"
   },
   "intake": {
     "missing_anchor_policy": "agent_discovery",
@@ -46,10 +54,22 @@
     "minimum_evidence_links": 1,
     "require_identity_gate_on_baseline": true
   },
-  "master_database": {"mode": "existing_base", "url": "https://example.feishu.cn/base/BASE_TOKEN"},
+  "master_database": {
+    "mode": "existing_base",
+    "url": "https://example.feishu.cn/base/BASE_TOKEN",
+    "people_table_name": "People",
+    "authoritative_roster": true
+  },
   "outputs": {
-    "document": {"enabled": true, "folder_token": "FOLDER_TOKEN"},
-    "message": {"enabled": true, "target_kind": "current_chat"}
+    "public": {
+      "document": {"enabled": true, "folder_token": "PUBLIC_FOLDER_TOKEN"},
+      "message": {"enabled": true, "target_kind": "current_chat"}
+    },
+    "developer": {
+      "local_markdown": {"enabled": true},
+      "document": {"enabled": false, "folder_token": "SEPARATE_DEV_FOLDER_TOKEN"},
+      "message": {"enabled": false}
+    }
   },
   "schedule": {
     "timezone": "Asia/Shanghai",
@@ -57,22 +77,32 @@
     "daily_digest": "18:00",
     "weekly_digest": "MON 08:30"
   },
-  "apis": {
-    "deepseek": {
-      "enabled": false,
-      "model": "deepseek-v4-flash",
-      "key_reference": "file:/secure/path/deepseek.key",
-      "max_calls_per_day": 100,
-      "max_total_tokens_per_day": 100000
-    },
-    "search": []
-  }
+  "agent_review": {
+    "mode": "execution_agent",
+    "required_for_publish": true,
+    "batch_size": 100
+  },
+  "scan_policy": {
+    "scholar": {
+      "max_requests_per_run": 8,
+      "max_requests_per_day": 64,
+      "max_requests_per_week": 448,
+      "recovery_canary_requests": 1,
+      "default_retry_after_hours": 24,
+      "maximum_retry_after_hours": 168
+    }
+  },
+  "apis": {"search": []}
 }
 ```
 
+`agent_review.batch_size` 必须为 1–200。运行时会把它作为单个持久审核快照的硬上限；当前快照
+完整原子提交后才租用下一批，因此大积压不会形成无界 Agent 请求，也不能跨快照局部提交。
+
 `schedule.timezone` 必须是可加载的 IANA 时区；`scan` 只允许 `hourly`、`daily`、
 `weekly`。日报时间严格使用 `HH:MM`，周报时间严格使用 `DDD HH:MM`（`DDD` 为
-`MON`—`SUN`）。后台 tick 固定每 15 分钟唤醒，但按该 cadence 判断扫描是否到期。
+`MON`—`SUN`）。OpenClaw 隔离宿主 Agent tick 每次先做廉价名单版本对账，再仅扫描 SQLite 中已到期的来源；
+`schedule.scan` 决定来源的健康检查周期，不会让名单同步变成网页全量重抓。
 
 来源 `kind` 只允许：`feishu_base`、`feishu_doc`、`feishu_wiki`、`local_file`、`people_intel_api`。
 `people_intel_api` 只接受通过公开 URL 安全门的 HTTPS 地址；禁止 loopback、私网、
@@ -122,7 +152,20 @@ baseline、candidate 与 observations 全部保留，只关闭后续扫描并写
 - `chat`：要求 `target_id=oc_xxx`，允许 bot CLI 直发。
 - `user`：要求 `target_id=ou_xxx`，允许 bot CLI 直发。
 
-DeepSeek `key_reference` 只能是 `file:`、`secret:`、`keychain:`、`vault:` 或绝对路径。无人值守 runtime 当前只解析 0600 普通文件；其他 secret manager 必须由宿主注入临时 0600 文件引用。
+`agent_review.mode` 固定为 `execution_agent`，`required_for_publish` 固定为 true。所有拟公开
+变化（包括规则判定为高价值的新论文/职位变化）都先交给当前宿主 Agent 最终裁定。旧配置若仍写
+`apis.deepseek.enabled=true` 会被拒绝；disabled 遗留项及 key 字段会被忽略并在规范化时移除，
+运行时不会读取该 key。
+
+旧 `outputs.document/message` 仍按用户报告读取，但新配置必须使用 `outputs.public` 与
+`outputs.developer`。开发者消息目标不得与用户消息目标相同；开发者输出缺省只落本地 0600
+Markdown。
+
+`master_database.mode=existing_base` 时，该 People 表默认就是权威名单，无需再在 `sources[]`
+重复配置。系统每次读取全表、全部分页并保留 `record_id`；权威表不得使用过滤 view 推断删除。
+运行时先读取完整 schema，缺少机器字段时只做幂等的新增字段迁移，绝不重命名/删除字段；缺少
+人工字段则停止对应写入并列入开发者报告。Base 的人工字段以表中现值为准，机器只更新其拥有的
+状态与审核说明字段。
 
 `intake.missing_anchor_policy`：
 

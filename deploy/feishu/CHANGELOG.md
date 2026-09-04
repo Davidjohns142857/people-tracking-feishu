@@ -1,5 +1,29 @@
 # Changelog
 
+## 0.9.0-portable.1 — 2026-09-04
+
+- 现有飞书 Base 成为名单事实源与审核工作台：保留 record_id/version hash，完整分页后才判定
+  removed，删除只做 tombstone，恢复复用历史，普通编辑只处理受影响记录。
+- 修复 Mono 复数字段映射，并为 People/Sources 写入加入 schema discovery、read-before-write、
+  人工/机器字段所有权和单表兼容；缺少的机器管理列安全增补，人工列不改名、不删除、不覆盖。
+- 增加 charset 严格解码、U+FFFD/异常年份/arXiv 年份交叉验证、same→same 抑制、稳定 ID
+  可解释 diff 和 parser anomaly 隔离；解析失败不推进候选或 baseline。
+- Scholar 采用固定周内相位、小批请求预算和持久 host circuit；429/Retry-After 会停止当轮余下
+  请求，跨重启等待，恢复后先做 canary。
+- 用户报告与开发者报告使用独立事件账本、窗口、幂等键和游标。用户报告只列具体的重要人员
+  变化；错误、覆盖率、429、待审核和修复状态只进入单独开发者报告。
+- 删除 DeepSeek 运行路径和发布包依赖。所有拟进入用户报告的变化都以
+  `people-tracking-agent-review-v1` 交给执行 Skill 的宿主 Agent，用自身 token 最终裁定；决定绑定
+  review_snapshot_id/request_id/evidence_hash，拒绝空批、缺项、局部重放和混合快照，以配置上限
+  拆分持久顺序批次并整批事务写入；defer 终结当前证据而不留下悬空 pending 事件。
+- OpenClaw 无人值守调度改为隔离宿主 Agent automation，由 Agent 循环消费 source/master/review/
+  delivery bridge；名单 checkpoint 绑定来源 bridge 身份且租期短于 15 分钟 tick，只允许同一工作流
+  立即续跑，未完成总表回写时用户报告 fail closed。
+- 总表写入先完成整批 schema/记录预检，再只更新机器字段并逐条回读；短时 live pre-read 有明确 TTL，
+  避免进程间沿用陈旧快照。离线发布自测覆盖 Agent 裁定、双报告和权威 Base 的人工字段保护。
+- 新增职位、任职单位、论文录用和重要奖项等优先建议发布；纯 UI/字符排版、same→same、异常年份、
+  页面移除及年级自然递增等在生成审核包前即抑制。
+
 ## 0.8.1-portable.1 — 2026-08-19
 
 - 修复本机 loopback proxy 使用 RFC 2544 Fake-IP DNS 时被公网 URL 安全门误拦截的问题；只允许 `198.18.0.0/15` 全量解析且目标域名未 bypass、匹配代理确为 loopback 的组合，普通私网与非 loopback 代理仍拒绝。
@@ -11,7 +35,7 @@
 - Bridge 必须带一次性 nonce、预期 source refs 和绑定 action/payload 的请求哈希；错误记录容器、缺项或裸 `all_ok=true` 不再能让 bootstrap 误报 ready。
 - 人工维护字段冲突时保留原值；严格扫描 0/0 失败；schedule 真正消费 hourly/daily/weekly cadence 并同步可见总库。
 - 安装中途失败会如实报告已变更路径并尝试回滚；rollback 可重复调用且不会再次移走已恢复目标。
-- Skill 入口禁写包内 bytecode，验签器安全忽略安装器本就排除的派生缓存；按推荐顺序先 doctor 再验签/安装不再自我阻断。
+- Skill 入口禁写包内 bytecode；发布校验拒绝派生缓存和超出完整内容扫描上限的文件。安装顺序为包外 checksum 成功后才解压，再做包内 manifest 校验、doctor 与安装。
 
 ## 0.8.0-portable.1 — 2026-08-10
 

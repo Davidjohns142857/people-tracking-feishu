@@ -20,7 +20,7 @@ for wheel in sorted((ROOT / "vendor" / "wheels").glob("*.whl")):
 sys.path.insert(0, WHEEL_RUNTIME.name)
 
 from people_intel.light_tracker import FetchObservation  # noqa: E402
-from people_tracking_feishu.cli import command_bootstrap  # noqa: E402
+from people_tracking_feishu.cli import command_bootstrap, command_sync  # noqa: E402
 from people_tracking_feishu.config import (  # noqa: E402
     ConfigError,
     RuntimePaths,
@@ -28,6 +28,12 @@ from people_tracking_feishu.config import (  # noqa: E402
     normalize_answers,
     secure_write_json,
     validate_config,
+)
+from people_tracking_feishu.reporting import (  # noqa: E402
+    PUBLIC_DECISION_SCHEMA,
+    apply_agent_review_decisions,
+    build_agent_review_bundle,
+    materialize_window_events,
 )
 from people_tracking_feishu.sandbox import algorithm_e2e  # noqa: E402
 from people_tracking_feishu.scheduler import scheduler_artifacts  # noqa: E402
@@ -82,11 +88,12 @@ def main() -> int:
                             "message": {"enabled": False},
                         },
                         "apis": {
-                            "deepseek": {
-                                "enabled": True,
-                                "model": "deepseek-v4-flash",
-                                "key_reference": "api_" + "key=synthetic-test-value",
-                            }
+                            "search": [
+                                {
+                                    "name": "synthetic-search",
+                                    "secret_reference": "api_" + "key=synthetic-test-value",
+                                }
+                            ]
                         },
                     }
                 )
@@ -178,7 +185,7 @@ def main() -> int:
                 result = tracking_module.scan_due(
                     state,
                     paths,
-                    {"state": "enabled", "apis": {"deepseek": {"enabled": False}}},
+                    {"state": "enabled", "apis": {"search": []}},
                     force_all=True,
                     force_full_fetch=True,
                     source_kinds=["homepage"],
@@ -234,6 +241,279 @@ def main() -> int:
 
         case("source_routes_preserve_baseline", source_routes_preserve_baseline)
 
+        def execution_agent_review_and_report_separation() -> None:
+            paths = RuntimePaths(
+                config_root=root / "report-config",
+                state_root=root / "report-state",
+                config_file=root / "report-config/config.json",
+                database=root / "report-state/people.sqlite3",
+                reports=root / "report-state/reports",
+                install_state=root / "report-config/install-state.json",
+            )
+            paths.ensure()
+            state = PortableState(paths.database)
+            try:
+                person = state.tracker.add_person(
+                    "Synthetic Reporter",
+                    urls=["https://synthetic.invalid/reporter"],
+                )
+                source_id = person["sources"][0]["source_id"]
+                observations = [
+                    (
+                        "paper",
+                        "changed",
+                        "healthy",
+                        {
+                            "additions": [
+                                {
+                                    "category": "publication",
+                                    "text": "Concrete Offline Paper, 2026",
+                                    "stable_id": "paper:offline-2026",
+                                }
+                            ],
+                            "modifications": [],
+                            "removals": [],
+                        },
+                        "confirmed publication change",
+                    ),
+                    (
+                        "failure",
+                        "source_issue",
+                        "rate_limited",
+                        {},
+                        "HTTP 429 parser error while scanning",
+                    ),
+                ]
+                for suffix, decision_status, health_status, delta, summary in observations:
+                    run_id = f"run-offline-{suffix}"
+                    observation_id = f"obs-offline-{suffix}"
+                    state.db.execute(
+                        """INSERT INTO runs(
+                             run_id,started_at,completed_at,trigger,status,purpose
+                           ) VALUES(?,?,?,?,?,'production')""",
+                        (
+                            run_id,
+                            "2026-09-04T01:00:00+00:00",
+                            "2026-09-04T01:05:00+00:00",
+                            "offline-self-test",
+                            "completed",
+                        ),
+                    )
+                    state.db.execute(
+                        """INSERT INTO observations(
+                             observation_id,run_id,source_id,observed_at,health_status,
+                             semantic_hash,decision_status,score,delta_json,summary,reviewer
+                           ) VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
+                        (
+                            observation_id,
+                            run_id,
+                            source_id,
+                            "2026-09-04T01:03:00+00:00",
+                            health_status,
+                            f"hash-offline-{suffix}",
+                            decision_status,
+                            0.95,
+                            json.dumps(delta, ensure_ascii=False),
+                            summary,
+                            "deterministic",
+                        ),
+                    )
+                state.db.commit()
+                materialize_window_events(
+                    state,
+                    window_start="2026-09-04T00:00:00+00:00",
+                    window_end="2026-09-04T02:00:00+00:00",
+                )
+                bundle = build_agent_review_bundle(state)
+                if len(bundle["requests"]) != 1 or state.unreported_public_events(
+                    through="2026-09-04T02:00:00+00:00"
+                ):
+                    raise AssertionError("public change bypassed execution-Agent review")
+                request = bundle["requests"][0]
+                evidence = request["evidence"]
+                applied = apply_agent_review_decisions(
+                    state,
+                    {
+                        "schema_version": PUBLIC_DECISION_SCHEMA,
+                        "review_snapshot_id": bundle["review_snapshot"]["snapshot_id"],
+                        "decided_by": "execution-agent:offline-self-test",
+                        "decisions": [
+                            {
+                                "request_id": request["request_id"],
+                                "evidence_hash": request["evidence_hash"],
+                                "decision": "publish",
+                                "change_type": "publication_added",
+                                "headline": "新增论文",
+                                "what_changed": "新增论文：Concrete Offline Paper, 2026",
+                                "why_material": "这是明确的新论文成果",
+                                "confidence": 0.99,
+                                "evidence_ids": [evidence["event_id"]],
+                            }
+                        ],
+                    },
+                )
+                if applied["applied"] != 1:
+                    raise AssertionError("execution-Agent decision was not applied")
+                prepared = tracking_module.prepare_digest(
+                    state,
+                    paths,
+                    {
+                        "state": "enabled",
+                        "schedule": {"timezone": "Asia/Shanghai"},
+                        "outputs": {
+                            "public": {
+                                "document": {"enabled": False},
+                                "message": {"enabled": False},
+                            },
+                            "developer": {
+                                "document": {"enabled": False},
+                                "message": {"enabled": False},
+                            },
+                        },
+                    },
+                    output_kind="daily",
+                    at=datetime(2026, 9, 4, 2, 0, tzinfo=timezone.utc),
+                )
+                public_report = prepared["report"]
+                developer_report = prepared["developer"]["report"]
+                if "Concrete Offline Paper, 2026" not in public_report:
+                    raise AssertionError("approved concrete change is missing from user report")
+                if "HTTP 429" in public_report or "parser" in public_report:
+                    raise AssertionError("developer diagnostic leaked into user report")
+                if "HTTP 429 parser error while scanning" not in developer_report:
+                    raise AssertionError("developer report lost the source diagnostic")
+            finally:
+                state.close()
+
+        case(
+            "execution_agent_review_and_report_separation",
+            execution_agent_review_and_report_separation,
+        )
+
+        def authoritative_base_bridge_preserves_live_human_fields() -> None:
+            paths = RuntimePaths(
+                config_root=root / "bridge-config",
+                state_root=root / "bridge-state",
+                config_file=root / "bridge-config/config.json",
+                database=root / "bridge-state/people.sqlite3",
+                reports=root / "bridge-state/reports",
+                install_state=root / "bridge-config/install-state.json",
+            )
+            paths.ensure()
+            config = normalize_answers(
+                {
+                    "runtime": {"mode": "openclaw"},
+                    "sources": [],
+                    "field_mapping": {
+                        "person_key": "Person Key",
+                        "record_type": "Record Type",
+                        "name": "Name",
+                        "secondary_id": "ID",
+                        "homepage": "Homepage",
+                    },
+                    "master_database": {
+                        "mode": "existing_base",
+                        "url": (
+                            "https://synthetic.feishu.cn/base/bas_offline"
+                            "?table=tbl_people"
+                        ),
+                        "base_token": "bas_offline",
+                        "people_table_id": "tbl_people",
+                    },
+                    "outputs": {
+                        "public": {
+                            "document": {"enabled": False},
+                            "message": {"enabled": False},
+                        },
+                        "developer": {"local_markdown": {"enabled": True}},
+                    },
+                    "schedule": {"timezone": "Asia/Shanghai", "scan": "daily"},
+                }
+            )
+            config["state"] = "enabled"
+            config["validation"] = {"all_ok": True}
+            secure_write_json(paths.config_file, config)
+            sync_args = argparse.Namespace(
+                lark_cli=None,
+                bridge_input=None,
+                master_bridge_results=None,
+                apply=True,
+                allow_validated=False,
+                include_local_sources=True,
+            )
+            waiting = command_sync(sync_args, paths)
+            request = waiting["bridge_request"]
+            source_ref = config["master_database"]["authoritative_source_ref"]
+            bridge_file = root / "authoritative-source-bridge.json"
+            secure_write_json(
+                bridge_file,
+                {
+                    "all_ok": True,
+                    "bridge_nonce": request["bridge_nonce"],
+                    "expected_refs": request["expected_refs"],
+                    "expected_refs_hash": request["expected_refs_hash"],
+                    "request_hash": request["request_hash"],
+                    "sources": [
+                        {
+                            "source_ref": source_ref,
+                            "source_complete": True,
+                            "base_token": "bas_offline",
+                            "table_id": "tbl_people",
+                            "schema_fields": [
+                                "Person Key",
+                                "Record Type",
+                                "Name",
+                                "ID",
+                                "Homepage",
+                                "Sync Status",
+                                "Human Notes",
+                            ],
+                            "payload": {
+                                "records": [
+                                    {
+                                        "record_id": "rec_offline_person",
+                                        "Name": "Offline Person",
+                                        "Person Key": "person_offline_1",
+                                        "Record Type": "人员",
+                                        "ID": "offline-1",
+                                        "Homepage": "https://synthetic.invalid/offline-person",
+                                        "Sync Status": "旧状态",
+                                        "Human Notes": "must survive",
+                                    }
+                                ]
+                            },
+                        }
+                    ],
+                },
+            )
+            sync_args.bridge_input = bridge_file
+            result = command_sync(sync_args, paths)
+            master_result = result.get("master_database") or {}
+            payload_file = Path(str(master_result.get("payload_file") or ""))
+            if not payload_file.is_file():
+                raise AssertionError("authoritative sync did not queue its safe write bridge")
+            payload = json.loads(payload_file.read_text(encoding="utf-8"))
+            people = payload["records"]["People"]
+            if len(people) != 1:
+                raise AssertionError("authoritative person row was duplicated")
+            item = people[0]
+            contract = item["write_contract"]
+            if item.get("target_record_id") != "rec_offline_person":
+                raise AssertionError("write bridge lost the authoritative record_id")
+            if contract["operation"] != "update":
+                raise AssertionError("authoritative row was converted into a create")
+            if contract["expected_before_fields"]["fields"].get(
+                "Human Notes"
+            ) != "must survive":
+                raise AssertionError("write bridge did not bind the live human fields")
+            if {"name", "homepage", "secondary_id"} & set(item["field_values"]):
+                raise AssertionError("write bridge exposed human-owned fields for update")
+
+        case(
+            "authoritative_base_bridge_preserves_live_human_fields",
+            authoritative_base_bridge_preserves_live_human_fields,
+        )
+
         def bootstrap_pipeline() -> None:
             source = root / "bootstrap-people.md"
             source.write_text(
@@ -268,7 +548,7 @@ def main() -> int:
                         "message": {"enabled": False},
                     },
                     "schedule": {"timezone": "Asia/Shanghai"},
-                    "apis": {"deepseek": {"enabled": False, "model": "deepseek-v4-flash"}},
+                    "apis": {"search": []},
                 }
             )
             secure_write_json(paths.config_file, config)

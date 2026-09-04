@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import codecs
 import hashlib
 import html
 import json
@@ -19,8 +20,6 @@ from typing import Any, Callable, Iterable, Literal
 
 from pypinyin import Style, lazy_pinyin
 
-from people_intel.deepseek_fallback import DeepSeekDiffReviewer
-
 
 SOURCE_KINDS = ("homepage", "scholar", "github", "linkedin")
 MEANINGFUL_CATEGORIES = {
@@ -32,6 +31,23 @@ NOISE_TEXT = {
     "sign in", "show more", "view all", "loading", "cookie settings",
     "accept cookies", "embedded files", "privacy",
 }
+
+PARSER_ANOMALY_EXTRACTOR_VERSION = "parser-anomaly-v1"
+PARSER_ANOMALY_CODES_KEY = "parser_anomaly_codes"
+PARSER_ANOMALY_DETAIL_KEY = "parser_anomaly_detail"
+_MIN_REASONABLE_PUBLICATION_YEAR = 1900
+_MAX_FUTURE_PUBLICATION_YEARS = 2
+
+
+class ParserQualityError(ValueError):
+    """A bounded public response cannot be decoded without corrupting evidence."""
+
+    def __init__(self, code: str, detail: str):
+        self.code = normalize_text(code)
+        self.detail = normalize_text(detail)
+        super().__init__(f"{self.code}: {self.detail}")
+
+
 COMPOUND_CHINESE_SURNAMES = {
     "欧阳", "太史", "端木", "上官", "司马", "东方", "独孤", "南宫",
     "万俟", "闻人", "夏侯", "诸葛", "尉迟", "公羊", "赫连", "澹台",
@@ -64,6 +80,106 @@ def normalize_key(value: str) -> str:
     value = normalize_text(value).casefold()
     value = re.sub(r"[^\w\u4e00-\u9fff]+", " ", value)
     return re.sub(r"\s+", " ", value).strip()
+
+
+def _declared_charsets(body: bytes, content_type: str | None) -> list[str]:
+    """Return explicit byte encodings in authority order, without guessing."""
+
+    values: list[str] = []
+    header = str(content_type or "")
+    header_match = re.search(
+        r"(?:^|;)\s*charset\s*=\s*[\"']?([^\s;\"']+)",
+        header,
+        re.I,
+    )
+    if header_match:
+        values.append(header_match.group(1))
+
+    # HTML encoding declarations are ASCII-compatible even when the document is
+    # not. BOM-marked UTF-16/32 is handled separately below.
+    prefix = body[:8_192].decode("ascii", errors="ignore")
+    for pattern in (
+        r"<meta\b[^>]*\bcharset\s*=\s*[\"']?([^\s;\"'/>]+)",
+        r"<meta\b[^>]*\bcontent\s*=\s*[\"'][^\"']*?charset\s*=\s*([^\s;\"']+)",
+        r"<\?xml\b[^>]*\bencoding\s*=\s*[\"']([^\"']+)[\"']",
+    ):
+        match = re.search(pattern, prefix, re.I)
+        if match:
+            values.append(match.group(1))
+
+    if body.startswith(codecs.BOM_UTF8):
+        values.insert(0, "utf-8-sig")
+    elif body.startswith((codecs.BOM_UTF32_LE, codecs.BOM_UTF32_BE)):
+        values.insert(0, "utf-32")
+    elif body.startswith((codecs.BOM_UTF16_LE, codecs.BOM_UTF16_BE)):
+        values.insert(0, "utf-16")
+
+    values.append("utf-8")
+    return list(dict.fromkeys(value.strip().casefold() for value in values if value.strip()))
+
+
+def _decode_public_body(body: bytes, content_type: str | None = None) -> str:
+    """Decode public bytes strictly so replacement characters never become facts."""
+
+    attempted: list[str] = []
+    failures: list[str] = []
+    for declared in _declared_charsets(body, content_type):
+        try:
+            encoding = codecs.lookup(declared).name
+        except LookupError:
+            failures.append(f"unsupported charset {declared}")
+            continue
+        if encoding in attempted:
+            continue
+        attempted.append(encoding)
+        try:
+            decoded = body.decode(encoding, errors="strict")
+        except UnicodeError:
+            failures.append(f"invalid {encoding} byte sequence")
+            continue
+        if "\ufffd" in decoded:
+            raise ParserQualityError(
+                "replacement_character",
+                f"decoded text using {encoding} contains U+FFFD",
+            )
+        return decoded
+    reason = "; ".join(failures[:4]) or "no supported charset declaration"
+    raise ParserQualityError(
+        "decode_failed",
+        f"strict decoding failed ({reason})",
+    )
+
+
+def _parser_anomaly_snapshot(
+    kind: str,
+    *,
+    code: str,
+    detail: str,
+) -> "FeatureSnapshot":
+    normalized_code = normalize_text(code)
+    normalized_detail = normalize_text(detail)
+    if not normalized_detail.casefold().startswith(
+        f"{normalized_code}:".casefold()
+    ):
+        normalized_detail = f"{normalized_code}: {normalized_detail}"
+    return _finalize_snapshot(
+        kind,
+        {},
+        [],
+        metrics={
+            PARSER_ANOMALY_CODES_KEY: normalized_code,
+            PARSER_ANOMALY_DETAIL_KEY: normalized_detail[:1_000],
+        },
+        extractor_version=PARSER_ANOMALY_EXTRACTOR_VERSION,
+    )
+
+
+def _snapshot_parser_anomalies(snapshot: "FeatureSnapshot") -> list[str]:
+    detail = normalize_text(str(snapshot.metrics.get(PARSER_ANOMALY_DETAIL_KEY) or ""))
+    codes = normalize_text(str(snapshot.metrics.get(PARSER_ANOMALY_CODES_KEY) or ""))
+    if detail:
+        return [value for value in detail.split("；") if value]
+    return [value for value in codes.split(",") if value]
 
 
 def _identity_key(value: str) -> str:
@@ -553,6 +669,7 @@ class ChangeDecision:
     status: Literal[
         "baseline", "unchanged", "noise", "candidate", "changed", "ambiguous",
         "source_issue_pending", "source_issue", "binding_review", "binding_conflict",
+        "parser_anomaly",
     ]
     score: float
     summary: str
@@ -565,6 +682,10 @@ class ChangeDecision:
     confirmations_required: int = 0
     quality_score: float = 1.0
     quality_reasons: list[str] = field(default_factory=list)
+    # None means that this observation did not produce a parser-quality
+    # assessment (for example, a 304 or a transport failure). Callers must not
+    # infer usability from HTTP success or health_status alone.
+    quality_usable: bool | None = None
 
 
 def _item(
@@ -1160,18 +1281,152 @@ def _extract_github(body: str | dict[str, Any] | list[Any]) -> FeatureSnapshot:
     )
 
 
-def extract_snapshot(kind: str, body: str | bytes | dict[str, Any] | list[Any]) -> FeatureSnapshot:
+def _modern_arxiv_date_tokens(value: str) -> list[tuple[str, int]]:
+    """Return raw YYMM tokens and their calendar year from modern arXiv IDs."""
+
+    output: list[tuple[str, int]] = []
+    patterns = (
+        r"\barxiv\s*:\s*(\d{2})(\d{2})\.\d{4,5}\b",
+        r"\barxiv\s*\.?\s*org\s*/\s*abs\s*/\s*(\d{2})(\d{2})\.\d{4,5}\b",
+    )
+    for pattern in patterns:
+        for match in re.finditer(pattern, value, re.I):
+            year_part, month_part = match.groups()
+            month = int(month_part)
+            if not 1 <= month <= 12:
+                continue
+            short_year = int(year_part)
+            calendar_year = 1900 + short_year if short_year >= 91 else 2000 + short_year
+            output.append((f"{year_part}{month_part}", calendar_year))
+    return list(dict.fromkeys(output))
+
+
+def _annotate_snapshot_parser_quality(snapshot: FeatureSnapshot) -> FeatureSnapshot:
+    anomalies: list[tuple[str, str]] = []
+    for key, value in snapshot.identity.items():
+        if "\ufffd" in str(value):
+            anomalies.append(
+                ("replacement_character", f"identity.{key} contains U+FFFD")
+            )
+    for index, item in enumerate(snapshot.items):
+        if "\ufffd" in item.text:
+            anomalies.append(
+                (
+                    "replacement_character",
+                    f"item[{index}].{item.category}.text contains U+FFFD",
+                )
+            )
+        for key, value in item.attributes.items():
+            if "\ufffd" in str(value):
+                anomalies.append(
+                    (
+                        "replacement_character",
+                        f"item[{index}].{item.category}.{key} contains U+FFFD",
+                    )
+                )
+
+    if snapshot.kind == "scholar":
+        maximum_year = datetime.now(timezone.utc).year + _MAX_FUTURE_PUBLICATION_YEARS
+        for index, item in enumerate(snapshot.items):
+            if item.category != "publication":
+                continue
+            raw_year = normalize_text(str(item.attributes.get("year") or ""))
+            if raw_year:
+                if not re.fullmatch(r"\d{4}", raw_year):
+                    anomalies.append(
+                        (
+                            "scholar_year_invalid",
+                            f"publication[{index}] year is not four digits",
+                        )
+                    )
+                    continue
+                year = int(raw_year)
+                if not _MIN_REASONABLE_PUBLICATION_YEAR <= year <= maximum_year:
+                    anomalies.append(
+                        (
+                            "scholar_year_out_of_range",
+                            f"publication[{index}] year {year} is outside "
+                            f"{_MIN_REASONABLE_PUBLICATION_YEAR}..{maximum_year}",
+                        )
+                    )
+                publication_evidence = " ".join(
+                    str(value)
+                    for value in [
+                        item.text,
+                        *item.attributes.values(),
+                        item.stable_id or "",
+                    ]
+                )
+                for raw_token, calendar_year in _modern_arxiv_date_tokens(
+                    publication_evidence
+                ):
+                    # A common malformed Scholar row closes the year capture on
+                    # an inner arXiv link and records YYMM (2010/1910/2405) as a
+                    # publication year. A real publication year may legitimately
+                    # differ from the arXiv upload year, so only reject the raw
+                    # YYMM token itself rather than requiring equality.
+                    if raw_year == raw_token and year != calendar_year:
+                        anomalies.append(
+                            (
+                                "scholar_year_is_arxiv_yymm",
+                                f"publication[{index}] year {raw_year} matches an "
+                                f"arXiv YYMM token; expected calendar year {calendar_year}",
+                            )
+                        )
+
+    if anomalies:
+        unique = list(dict.fromkeys(anomalies))
+        snapshot.metrics[PARSER_ANOMALY_CODES_KEY] = ",".join(
+            dict.fromkeys(code for code, _ in unique)
+        )
+        snapshot.metrics[PARSER_ANOMALY_DETAIL_KEY] = "；".join(
+            f"{code}: {detail}" for code, detail in unique
+        )[:1_000]
+    return snapshot
+
+
+def extract_snapshot(
+    kind: str,
+    body: str | bytes | dict[str, Any] | list[Any],
+    *,
+    content_type: str | None = None,
+) -> FeatureSnapshot:
     if isinstance(body, bytes):
-        body = body.decode("utf-8", errors="replace")
+        try:
+            body = _decode_public_body(body, content_type)
+        except ParserQualityError as exc:
+            return _parser_anomaly_snapshot(
+                kind,
+                code=exc.code,
+                detail=str(exc),
+            )
+    if isinstance(body, str) and "\ufffd" in body:
+        return _parser_anomaly_snapshot(
+            kind,
+            code="replacement_character",
+            detail="input text contains U+FFFD",
+        )
+    if isinstance(body, (dict, list)):
+        structured_text = json.dumps(body, ensure_ascii=False)
+        if "\ufffd" in structured_text:
+            return _parser_anomaly_snapshot(
+                kind,
+                code="replacement_character",
+                detail="structured input contains U+FFFD",
+            )
     if kind == "linkedin" and isinstance(body, dict):
-        return _extract_linkedin_structured(body)
+        snapshot = _extract_linkedin_structured(body)
+        return _annotate_snapshot_parser_quality(snapshot)
     if kind == "github":
-        return _extract_github(body)
+        snapshot = _extract_github(body)
+        return _annotate_snapshot_parser_quality(snapshot)
     if not isinstance(body, str):
         body = json.dumps(body, ensure_ascii=False)
     if kind == "scholar":
-        return _extract_scholar(body)
-    return _extract_generic(body, kind)
+        snapshot = _extract_scholar(body)
+    else:
+        snapshot = _extract_generic(body, kind)
+    return _annotate_snapshot_parser_quality(snapshot)
 
 
 def health_status(observation: FetchObservation, expected_kind: str) -> tuple[str, str]:
@@ -1391,6 +1646,9 @@ def assess_snapshot(
     """Score whether a 200 response is complete enough to compare safely."""
     expected_names = list(expected_names)
     source_scoped_names = list(source_scoped_names)
+    parser_anomalies = _snapshot_parser_anomalies(snapshot)
+    if parser_anomalies:
+        return 0.0, parser_anomalies, False
     score = 1.0
     reasons: list[str] = []
     usable = True
@@ -1585,6 +1843,8 @@ def compare_snapshots(old: FeatureSnapshot | None, new: FeatureSnapshot) -> Chan
             modifications.append({
                 "category": after.category,
                 "stable_id": after.stable_id,
+                "before_stable_id": before.stable_id,
+                "after_stable_id": after.stable_id,
                 "before": before.text,
                 "after": after.text,
                 "before_attributes": before.attributes,
@@ -1616,19 +1876,36 @@ def compare_snapshots(old: FeatureSnapshot | None, new: FeatureSnapshot) -> Chan
         )
         ratio = SequenceMatcher(None, normalize_key(best.text), normalize_key(added.text)).ratio() if best else 0
         if best and ratio >= 0.72:
+            changed_fields = sorted(
+                field_name
+                for field_name in set(best.attributes) | set(added.attributes)
+                if normalize_key(best.attributes.get(field_name, ""))
+                != normalize_key(added.attributes.get(field_name, ""))
+            )
+            before_stable_id = best.stable_id
+            after_stable_id = added.stable_id
+            stable_id_changed = normalize_text(before_stable_id or "") != normalize_text(
+                after_stable_id or ""
+            )
+            text_changed = normalize_key(best.text) != normalize_key(added.text)
+            if not text_changed and not changed_fields and not stable_id_changed:
+                # Consume an exact duplicate without fabricating ``text → text``.
+                # This is defensive for legacy/corrupt manifests whose item keys
+                # differ despite carrying no user-explainable delta.
+                remaining_remove.remove(best)
+                continue
+            if stable_id_changed:
+                changed_fields = sorted([*changed_fields, "stable_id"])
             modifications.append({
                 "category": added.category,
                 "stable_id": added.stable_id,
+                "before_stable_id": before_stable_id,
+                "after_stable_id": after_stable_id,
                 "before": best.text,
                 "after": added.text,
                 "before_attributes": best.attributes,
                 "after_attributes": added.attributes,
-                "changed_fields": sorted(
-                    field_name
-                    for field_name in set(best.attributes) | set(added.attributes)
-                    if normalize_key(best.attributes.get(field_name, ""))
-                    != normalize_key(added.attributes.get(field_name, ""))
-                ),
+                "changed_fields": changed_fields,
             })
             remaining_remove.remove(best)
         else:
@@ -1673,9 +1950,13 @@ def compare_snapshots(old: FeatureSnapshot | None, new: FeatureSnapshot) -> Chan
         + (0.55 if identity_changed else 0),
     )
     payload = {
-        "additions": [asdict(item) for item in additions[:12]],
-        "removals": [asdict(item) for item in removals[:12]],
-        "modifications": modifications[:12],
+        # Snapshots are already capped at 1,200 semantic items.  Do not truncate
+        # their delta again: once a confirmed baseline advances, an omitted item
+        # can never be rediscovered.  Review delivery provides its own durable,
+        # bounded pagination without losing events.
+        "additions": [asdict(item) for item in additions],
+        "removals": [asdict(item) for item in removals],
+        "modifications": modifications,
     }
     if (
         identity_changed
@@ -1747,6 +2028,7 @@ def _scheduled_next_check_at(
     health_status: str,
     consecutive_failures: int,
     source_id: str,
+    kind: str | None = None,
 ) -> str:
     """Schedule healthy cadence or an earlier, jittered recovery probe."""
 
@@ -1764,6 +2046,25 @@ def _scheduled_next_check_at(
         delay = timedelta(hours=min(24, 2 ** (failures - 1))) + jitter
     elif health_status == "degraded":
         delay = timedelta(hours=24) + jitter
+    elif kind == "scholar":
+        # Give each Scholar source a stable slot inside its cadence window.
+        # This spreads a same-time baseline rebuild across the week while a
+        # source that is already on its slot keeps its configured cadence.
+        cadence = max(1, int(cadence_days or 7))
+        cycle_seconds = cadence * 24 * 60 * 60
+        phase_seconds = int(_sha(source_id, 16), 16) % cycle_seconds
+        observed_seconds = observed.timestamp()
+        cycle_start = int(observed_seconds // cycle_seconds) * cycle_seconds
+        candidate_seconds = cycle_start + phase_seconds
+        if candidate_seconds <= observed_seconds:
+            candidate_seconds += cycle_seconds
+        candidate = datetime.fromtimestamp(
+            candidate_seconds,
+            tz=observed.tzinfo or timezone.utc,
+        )
+        # Avoid immediate recrawls when a source is first enrolled just before
+        # its stable slot. The next cycle naturally returns to the stable slot.
+        return max(candidate, observed + timedelta(days=1)).isoformat()
     else:
         delay = timedelta(days=max(1, int(cadence_days or 7)))
     return (observed + delay).isoformat()
@@ -1885,6 +2186,7 @@ class LightTracker:
         urls: list[str] | None = None,
         profile: dict[str, Any] | None = None,
         secondary_id: tuple[str, str] | None = None,
+        commit: bool = True,
     ) -> dict[str, Any]:
         sources: dict[str, list[str]] = {}
         for value in urls or []:
@@ -1969,7 +2271,8 @@ class LightTracker:
                        VALUES(?,?,?,?,?) ON CONFLICT(person_key,kind,url) DO NOTHING""",
                     (source_id, person_key, kind, url, external_id),
                 )
-        self.db.commit()
+        if commit:
+            self.db.commit()
         return self.person(person_key)
 
     def person(self, person_key: str) -> dict[str, Any]:
@@ -2063,6 +2366,45 @@ class LightTracker:
             output.append(item)
         return output
 
+    def stagger_new_scholar_sources(
+        self,
+        source_ids: Iterable[str],
+        *,
+        immediate_limit: int = 8,
+        as_of: str | None = None,
+    ) -> list[str]:
+        """Spread a bulk Scholar enrollment while leaving a small canary due now."""
+
+        identifiers = sorted({str(value) for value in source_ids if str(value)})
+        if not identifiers:
+            return []
+        placeholders = ",".join("?" for _ in identifiers)
+        rows = self.db.execute(
+            f"""SELECT source_id,cadence_days FROM sources
+                WHERE source_id IN ({placeholders}) AND kind='scholar'
+                  AND last_checked_at IS NULL AND next_check_at IS NULL
+                ORDER BY source_id""",
+            identifiers,
+        ).fetchall()
+        boundary = as_of or utc_now()
+        staggered: list[str] = []
+        for row in rows[max(0, int(immediate_limit)) :]:
+            due = _scheduled_next_check_at(
+                boundary,
+                cadence_days=int(row["cadence_days"] or 7),
+                health_status="healthy",
+                consecutive_failures=0,
+                source_id=str(row["source_id"]),
+                kind="scholar",
+            )
+            self.db.execute(
+                "UPDATE sources SET next_check_at=? WHERE source_id=?",
+                (due, row["source_id"]),
+            )
+            staggered.append(str(row["source_id"]))
+        self.db.commit()
+        return staggered
+
     def linkedin_profile_state(self, source_id: str) -> dict[str, Any]:
         row = self.db.execute(
             """SELECT s.*,p.canonical_name FROM sources s
@@ -2153,6 +2495,61 @@ class LightTracker:
         timing_sink: dict[str, float] | None = None,
         ai_usage_sink: dict[str, int] | None = None,
     ) -> ChangeDecision:
+        """Persist one observation atomically, including its source transition."""
+
+        savepoint = f"observe_{_sha(f'{run_id}|{source_id}', 20)}"
+        started_transaction = not self.db.in_transaction
+        if started_transaction:
+            self.db.execute("BEGIN")
+        try:
+            self.db.execute(f"SAVEPOINT {savepoint}")
+        except BaseException:
+            if started_transaction:
+                self.db.rollback()
+            raise
+        try:
+            decision = self._observe_in_savepoint(
+                run_id,
+                source_id,
+                observation,
+                reviewer=reviewer,
+                timing_sink=timing_sink,
+                ai_usage_sink=ai_usage_sink,
+            )
+        except BaseException:
+            rolled_back_to_savepoint = False
+            try:
+                self.db.execute(f"ROLLBACK TO SAVEPOINT {savepoint}")
+                rolled_back_to_savepoint = True
+            except sqlite3.Error:
+                pass
+            finally:
+                try:
+                    self.db.execute(f"RELEASE SAVEPOINT {savepoint}")
+                except sqlite3.Error:
+                    pass
+            if started_transaction or not rolled_back_to_savepoint:
+                self.db.rollback()
+            raise
+        try:
+            self.db.execute(f"RELEASE SAVEPOINT {savepoint}")
+            if started_transaction:
+                self.db.commit()
+        except BaseException:
+            self.db.rollback()
+            raise
+        return decision
+
+    def _observe_in_savepoint(
+        self,
+        run_id: str,
+        source_id: str,
+        observation: FetchObservation,
+        *,
+        reviewer: Callable[[ChangeDecision], ChangeDecision] | None = None,
+        timing_sink: dict[str, float] | None = None,
+        ai_usage_sink: dict[str, int] | None = None,
+    ) -> ChangeDecision:
         observe_started = perf_counter()
 
         def record_timing(name: str, started: float) -> None:
@@ -2161,54 +2558,11 @@ class LightTracker:
                     perf_counter() - started
                 )
 
-        def record_ai(name: str) -> None:
-            if ai_usage_sink is not None:
-                ai_usage_sink[name] = ai_usage_sink.get(name, 0) + 1
-
-        def summarize_confirmed_change(
-            decision: ChangeDecision,
-            *,
-            snapshot: FeatureSnapshot,
-            quality_score: float,
-            quality_reasons: list[str],
-            identity_gate_passed: bool,
-        ) -> ChangeDecision:
-            context = {
-                "person_key": source["person_key"],
-                "source_id": source_id,
-                "source_kind": source["kind"],
-                "retrieval_mode": snapshot.retrieval_mode,
-                "health_status": "healthy",
-                "identity_gate_passed": identity_gate_passed,
-                "quality_score": quality_score,
-                "quality_reasons": quality_reasons,
-                "has_confirmed_baseline": old is not None,
-                "change_confirmed": True,
-            }
-            eligible, _ = DeepSeekDiffReviewer.summary_eligibility(
-                decision,
-                context,
-            )
-            if not eligible:
-                record_ai("confirmed_summary_ineligible")
-                return decision
-            record_ai("confirmed_summary_eligible")
-            summarize_method = getattr(reviewer, "summarize_confirmed", None)
-            if not callable(summarize_method):
-                record_ai("confirmed_summary_skipped_unconfigured")
-                return decision
-            record_ai("confirmed_summary_attempted")
-            try:
-                summarized = summarize_method(decision, context=context)
-            except Exception as exc:
-                record_ai("confirmed_summary_failed")
-                decision.summary += (
-                    f"；确认结果不受影响，模型摘要未生成"
-                    f"（{type(exc).__name__}）"
-                )
-                return decision
-            record_ai("confirmed_summary_completed")
-            return summarized
+        # Retain these keyword arguments for callers on the v0.8 interface, but
+        # the deterministic tracker must never invoke a reviewer or an external
+        # model. AI classification/report wording belongs outside this atomic
+        # baseline transition.
+        _ = reviewer, ai_usage_sink
 
         state_started = perf_counter()
         source = self.db.execute(
@@ -2235,7 +2589,62 @@ class LightTracker:
         quality_payload: dict[str, Any] = {}
         extractor_version = old.extractor_version if old else None
 
-        if observation.status_code == 304 and old is not None:
+        quarantined_candidate: FeatureSnapshot | None = None
+        quarantined_decision: ChangeDecision | None = None
+        if source["candidate_snapshot_json"] and source["candidate_decision_json"]:
+            try:
+                candidate_payload = json.loads(source["candidate_decision_json"])
+                if candidate_payload.get("status") == "parser_anomaly":
+                    quarantined_candidate = FeatureSnapshot.from_json(
+                        source["candidate_snapshot_json"]
+                    )
+                    quarantined_decision = ChangeDecision(**candidate_payload)
+            except (TypeError, ValueError, json.JSONDecodeError):
+                quarantined_candidate = None
+                quarantined_decision = None
+
+        if (
+            observation.status_code == 304
+            and old is not None
+            and quarantined_candidate is not None
+            and quarantined_decision is not None
+        ):
+            transition_started = perf_counter()
+            semantic_hash = source["semantic_hash"]
+            extractor_version = quarantined_candidate.extractor_version
+            try:
+                quality_payload = json.loads(source["quality_json"] or "{}")
+            except (TypeError, json.JSONDecodeError):
+                quality_payload = {}
+            failures = int(source["consecutive_failures"] or 0) + 1
+            decision = quarantined_decision
+            decision.health_status = "degraded"
+            decision.confirmation_count = 0
+            decision.confirmations_required = 0
+            decision.summary = (
+                f"{decision.summary}；304 仅证明异常表示未变，"
+                "不作为人员变化确认，等待强制正文复验"
+            )
+            if authoritative_run:
+                self.db.execute(
+                    """UPDATE sources SET health_status='degraded',health_detail=?,
+                       consecutive_failures=?,last_checked_at=?,
+                       etag=COALESCE(?,etag),last_modified=COALESCE(?,last_modified)
+                       WHERE source_id=?""",
+                    (
+                        decision.summary,
+                        failures,
+                        observation.observed_at,
+                        observation.etag,
+                        observation.last_modified,
+                        source_id,
+                    ),
+                )
+            record_timing(
+                "parser_anomaly_conditional_quarantine_transition",
+                transition_started,
+            )
+        elif observation.status_code == 304 and old is not None:
             transition_started = perf_counter()
             semantic_hash = source["semantic_hash"]
             if source["candidate_snapshot_json"] and source["candidate_decision_json"]:
@@ -2321,15 +2730,6 @@ class LightTracker:
                         decision.status = "changed"
                         decision.summary += (
                             f"；候选变化经条件请求达到 {count}/{required} 次确认"
-                        )
-                        decision = summarize_confirmed_change(
-                            decision,
-                            snapshot=candidate,
-                            quality_score=decision.quality_score,
-                            quality_reasons=decision.quality_reasons,
-                            identity_gate_passed=bool(
-                                stored_quality.get("usable", True)
-                            ),
                         )
                         semantic_hash = candidate.semantic_hash
                         self.db.execute(
@@ -2427,7 +2827,21 @@ class LightTracker:
             record_timing("health_failure_state_transition", transition_started)
         else:
             extraction_started = perf_counter()
-            snapshot = extract_snapshot(source["kind"], observation.body)
+            try:
+                snapshot = extract_snapshot(
+                    source["kind"],
+                    observation.body,
+                    content_type=observation.content_type,
+                )
+            except Exception as exc:
+                snapshot = _parser_anomaly_snapshot(
+                    source["kind"],
+                    code="parser_exception",
+                    detail=(
+                        f"extract_snapshot raised {type(exc).__name__}: "
+                        f"{normalize_text(str(exc))[:300]}"
+                    ),
+                )
             snapshot.retrieval_mode = observation.retrieval_mode
             if not snapshot.canonical_url and observation.final_url:
                 snapshot.canonical_url = canonical_url(observation.final_url)
@@ -2464,6 +2878,7 @@ class LightTracker:
                 curated_binding=curated_binding,
                 identity_assessment=identity_result,
             )
+            parser_anomaly_reasons = _snapshot_parser_anomalies(snapshot)
             record_timing("identity_and_completeness_gate", quality_started)
             quality_payload = {
                 "score": quality_score,
@@ -2475,9 +2890,11 @@ class LightTracker:
                 "sentinels": snapshot.sentinels,
                 "truncated": snapshot.truncated,
                 "binding": asdict(identity_result),
+                "parser_anomalies": parser_anomaly_reasons,
             }
             limited_baseline_heartbeat = bool(
                 not usable
+                and not parser_anomaly_reasons
                 and old is not None
                 and source["kind"] in {"linkedin", "scholar"}
                 and identity_result.status == "verified"
@@ -2532,7 +2949,74 @@ class LightTracker:
                 )
             elif not usable:
                 transition_started = perf_counter()
-                if identity_result.status in {"review", "conflict"}:
+                if parser_anomaly_reasons:
+                    failures = int(source["consecutive_failures"] or 0) + 1
+                    decision = ChangeDecision(
+                        "parser_anomaly",
+                        0.0,
+                        f"{source['kind']} 解析异常，已隔离且未推进确认基线："
+                        f"{'；'.join(parser_anomaly_reasons)}",
+                        health_status="degraded",
+                        confirmation_count=0,
+                        confirmations_required=0,
+                        quality_score=quality_score,
+                        quality_reasons=quality_reasons,
+                    )
+                    existing_candidate_is_quarantined = (
+                        quarantined_candidate is not None
+                        and quarantined_decision is not None
+                    )
+                    can_store_quarantine = authoritative_run and (
+                        source["candidate_snapshot_json"] is None
+                        or existing_candidate_is_quarantined
+                    )
+                    if can_store_quarantine:
+                        candidate_representation = (
+                            snapshot.comparison_hash or snapshot.semantic_hash
+                        )
+                        first_seen = (
+                            source["candidate_first_seen_at"]
+                            if existing_candidate_is_quarantined
+                            and source["candidate_hash"] == candidate_representation
+                            else observation.observed_at
+                        )
+                        self.db.execute(
+                            """UPDATE sources SET health_status='degraded',health_detail=?,
+                               consecutive_failures=?,last_checked_at=?,last_full_fetch_at=NULL,
+                               quality_json=?,candidate_snapshot_json=?,candidate_hash=?,
+                               candidate_count=0,candidate_first_seen_at=?,
+                               candidate_decision_json=?,candidate_last_run_id=?
+                               WHERE source_id=?""",
+                            (
+                                decision.summary,
+                                failures,
+                                observation.observed_at,
+                                json.dumps(quality_payload, ensure_ascii=False),
+                                snapshot.to_json(),
+                                candidate_representation,
+                                first_seen,
+                                json.dumps(asdict(decision), ensure_ascii=False),
+                                run_id,
+                                source_id,
+                            ),
+                        )
+                    else:
+                        # Never replace a valid pending candidate with malformed
+                        # parser output. Non-production runs also preserve all
+                        # candidate state byte-for-byte.
+                        self.db.execute(
+                            """UPDATE sources SET health_status='degraded',health_detail=?,
+                               consecutive_failures=?,last_checked_at=?,last_full_fetch_at=NULL,
+                               quality_json=? WHERE source_id=?""",
+                            (
+                                decision.summary,
+                                failures,
+                                observation.observed_at,
+                                json.dumps(quality_payload, ensure_ascii=False),
+                                source_id,
+                            ),
+                        )
+                elif identity_result.status in {"review", "conflict"}:
                     status = (
                         "binding_conflict"
                         if identity_result.status == "conflict"
@@ -2629,41 +3113,7 @@ class LightTracker:
                     decision = compare_snapshots(old, snapshot)
                 decision.quality_score = quality_score
                 decision.quality_reasons = quality_reasons
-                if decision.status == "ambiguous":
-                    review_context = {
-                        "person_key": source["person_key"],
-                        "source_id": source_id,
-                        "source_kind": source["kind"],
-                        "retrieval_mode": snapshot.retrieval_mode,
-                        "health_status": "healthy",
-                        "identity_gate_passed": usable,
-                        "quality_score": quality_score,
-                        "quality_reasons": quality_reasons,
-                        "has_confirmed_baseline": old is not None,
-                    }
-                    eligible, _ = DeepSeekDiffReviewer.eligibility(
-                        decision,
-                        review_context,
-                    )
-                    if eligible:
-                        record_ai("ambiguous_review_eligible")
-                    review_method = getattr(reviewer, "review", None)
-                    if not callable(review_method):
-                        if eligible:
-                            record_ai("ambiguous_review_skipped_unconfigured")
-                    else:
-                        record_ai("ambiguous_review_attempted")
-                        try:
-                            decision = review_method(
-                                decision,
-                                context=review_context,
-                            )
-                        except Exception as exc:  # keep deterministic result and make fallback visible
-                            record_ai("ambiguous_review_failed")
-                            decision.summary += f"；模型复核失败，保留待审（{type(exc).__name__}）"
-                        else:
-                            record_ai("ambiguous_review_completed")
-                record_timing("snapshot_diff_and_optional_review", diff_started)
+                record_timing("snapshot_diff", diff_started)
 
                 transition_started = perf_counter()
                 accepted_snapshot = old
@@ -2714,13 +3164,6 @@ class LightTracker:
                         changed_at = observation.observed_at
                         clear_candidate = True
                         decision.summary += f"；经 {count}/{required} 次一致观测确认"
-                        decision = summarize_confirmed_change(
-                            decision,
-                            snapshot=snapshot,
-                            quality_score=quality_score,
-                            quality_reasons=quality_reasons,
-                            identity_gate_passed=usable,
-                        )
                     else:
                         decision.status = "candidate"
                         decision.summary += f"；候选 {count}/{required}，未写入确认基线"
@@ -2825,6 +3268,8 @@ class LightTracker:
                     "confirmation_and_baseline_transition",
                     transition_started,
                 )
+        if "usable" in quality_payload:
+            decision.quality_usable = quality_payload["usable"] is True
         persist_started = perf_counter()
         failed_health = decision.health_status != "healthy"
         failure_count = (
@@ -2838,6 +3283,7 @@ class LightTracker:
             health_status=decision.health_status,
             consecutive_failures=failure_count,
             source_id=source_id,
+            kind=source["kind"],
         )
         successful_at = (
             observation.observed_at
@@ -2870,7 +3316,6 @@ class LightTracker:
                 decision.confirmation_count, decision.confirmations_required, extractor_version,
             ),
         )
-        self.db.commit()
         record_timing("observation_audit_persist", persist_started)
         record_timing("observe_total", observe_started)
         return decision
@@ -2963,6 +3408,10 @@ class LightTracker:
                 candidate_detail = json.loads(row["candidate_decision_json"] or "{}")
             except (TypeError, json.JSONDecodeError):
                 candidate_detail = {}
+            if candidate_detail.get("status") == "parser_anomaly":
+                # Parser quarantine belongs in developer diagnostics, never in
+                # the people-change digest or its aged-candidate appendix.
+                continue
             aged_candidates.append((row, age_days, candidate_detail))
         lines = [
             "# 人才跟踪更新",
@@ -2991,7 +3440,24 @@ class LightTracker:
             for item in delta["additions"][:8]:
                 lines.append(f"- 新增：{item['text']}")
             for item in delta["modifications"][:8]:
-                lines.append(f"- 更新：{item['before']} → {item['after']}")
+                before = normalize_text(str(item.get("before") or ""))
+                after = normalize_text(str(item.get("after") or ""))
+                before_stable_id = normalize_text(
+                    str(item.get("before_stable_id") or "")
+                )
+                after_stable_id = normalize_text(
+                    str(item.get("after_stable_id") or item.get("stable_id") or "")
+                )
+                if (
+                    normalize_key(before) == normalize_key(after)
+                    and before_stable_id != after_stable_id
+                ):
+                    lines.append(
+                        f"- 相关链接更新：{before_stable_id or '无'} → "
+                        f"{after_stable_id or '无'}（条目：{after}）"
+                    )
+                elif normalize_key(before) != normalize_key(after):
+                    lines.append(f"- 更新：{before} → {after}")
             for item in delta["removals"][:5]:
                 lines.append(f"- 页面不再显示：{item['text']}（仅记录页面变化，不自动推断离职或撤回）")
             lines.extend([f"- 来源：[{row['url']}]({row['url']})", ""])
@@ -3210,7 +3676,7 @@ def dossier_records(path: str | Path, format_name: Literal["icml", "apple"]) -> 
 
 
 __all__ = [
-    "ChangeDecision", "DeepSeekDiffReviewer", "FeatureSnapshot", "FetchObservation",
+    "ChangeDecision", "FeatureSnapshot", "FetchObservation",
     "IdentityAssessment", "LightTracker", "assess_identity_binding",
     "assess_snapshot", "canonical_url", "classify_url", "compare_snapshots",
     "dossier_records", "dossier_records_from_text", "extract_snapshot",
