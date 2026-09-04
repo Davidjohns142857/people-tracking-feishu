@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import hashlib
 import ipaddress
 import json
 import os
 import re
 import stat
+import unicodedata
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -64,17 +66,62 @@ _CREDENTIAL_QUERY_NAMES = {
     "x-goog-signature",
 }
 DEFAULT_FIELDS = {
+    "person_key": "人员编号",
+    "record_type": "记录类型",
     "name": "姓名",
     "secondary_id": "第二ID",
     "aliases": "别名",
     "school": "学校",
     "research_focus": "专业/研究方向",
     "stage": "阶段/年龄",
+    "employment_status": "任职状态",
     "homepage": "个人主页",
     "scholar": "Google Scholar",
     "github": "GitHub",
     "linkedin": "LinkedIn",
+    "sync_status": "同步状态",
+    "tracking_status": "跟踪状态",
+    "review_status": "审核状态",
+    "review_detail": "待确认信息",
+    "review_decision": "审核决定",
+    "managed_by": "管理方式",
 }
+
+# Field ownership is a safety boundary, not merely display metadata.  The
+# authoritative roster may use arbitrary column names, so a configuration must
+# never allow a machine-maintained semantic to alias a column curated by a
+# person.  Keep this list local to config.py: importing master.py here would
+# introduce a config -> master -> state -> config cycle.
+_HUMAN_OWNED_FIELD_SEMANTICS = frozenset(
+    {
+        "name",
+        "secondary_id",
+        "aliases",
+        "school",
+        "research_focus",
+        "stage",
+        "employment_status",
+        "cohorts",
+        "homepage",
+        "scholar",
+        "github",
+        "linkedin",
+        "review_decision",
+    }
+)
+_MACHINE_OWNED_FIELD_SEMANTICS = frozenset(
+    {
+        "person_key",
+        "record_type",
+        "source_documents",
+        "identity_confidence",
+        "tracking_status",
+        "sync_status",
+        "review_status",
+        "review_detail",
+        "managed_by",
+    }
+)
 QUESTIONNAIRE = """请一次性回复下面这份人员跟踪配置问卷。可以写“不启用”或“使用默认值”；请勿在聊天中发送任何 API key、App Secret、Cookie 或密码。
 
 1. 人员来源
@@ -83,7 +130,7 @@ QUESTIONNAIRE = """请一次性回复下面这份人员跟踪配置问卷。可�
 - 受控本地文件路径或 People Intel API（如无请写无）：
 
 2. 字段映射
-- 姓名、第二 ID、别名、学校、专业/研究方向、阶段/年龄分别对应什么字段？
+- 人员编号、记录类型、姓名、第二 ID、别名、学校、专业/研究方向、阶段/年龄、任职状态分别对应什么字段？
 - 个人主页、Google Scholar、GitHub、LinkedIn 分别对应什么字段？
 - 如果某人四类主页全缺失：自动检索补全（推荐）/仅进入人工队列？
 
@@ -91,9 +138,10 @@ QUESTIONNAIRE = """请一次性回复下面这份人员跟踪配置问卷。可�
 - 选择：使用现有 Base / 创建新 Base / 仅本地或 API
 - 如果使用现有 Base，请给 Base URL 和 People/Sources 表名或单表表名。
 
-4. 输出
-- 日期云文档：启用/不启用；目标文件夹 token 或 Wiki 空间/节点（不要提供凭证）
-- 飞书消息：当前会话 / 固定群 chat_id / 固定用户 open_id / 不启用
+4. 输出（用户报告与开发者报告必须分开）
+- 用户报告：日期云文档启用/不启用；飞书消息发到当前会话 / 固定群 chat_id / 固定用户 open_id / 不启用
+- 开发者报告：默认只写单独的本地 Markdown；如需飞书文档，请提供独立文件夹 token 或 Wiki 空间/节点（不要提供凭证）
+- 用户报告只写具体、重要的人员变化；解析错误、覆盖率、待审核项和修复状态只写开发者报告
 
 5. 频率与时区
 - 来源扫描频率（默认每周）：
@@ -101,10 +149,8 @@ QUESTIONNAIRE = """请一次性回复下面这份人员跟踪配置问卷。可�
 - 周报时间（默认周一 08:30）：
 - 时区（默认 Asia/Shanghai）：
 
-6. API
-- DeepSeek V4 Flash：启用/不启用
-- 如启用，只提供 mode-0600 key 文件或 secret manager 引用，不要提供 key 值
-- 每日最大调用数、每日最大 token、月度预算：
+6. 执行 Agent 与可选搜索 API
+- 变化裁定由执行本 Skill 的 Agent 完成，复用该 Agent 自身 token；无需、也不接受 DeepSeek key
 - 其他搜索 API：名称、secret 引用与预算（如无请写无）
 
 收到后我会先生成草稿并只读探测来源、字段和权限；在你回复“确认启用”前，不导入、不创建正式 Base、不注册调度、不发送正式报告。"""
@@ -112,6 +158,146 @@ QUESTIONNAIRE = """请一次性回复下面这份人员跟踪配置问卷。可�
 
 class ConfigError(ValueError):
     pass
+
+
+def _physical_field_identity(value: str) -> str:
+    """Return the comparison identity used by Feishu field resolution."""
+
+    normalized = unicodedata.normalize("NFKC", value).strip().casefold()
+    return re.sub(r"\s+", " ", normalized)
+
+
+def _mapping_field_names(value: Any) -> list[str]:
+    if isinstance(value, str):
+        return [value] if value.strip() else []
+    if isinstance(value, (list, tuple)):
+        return [str(item) for item in value if isinstance(item, str) and item.strip()]
+    return []
+
+
+def _validate_one_field_mapping(mapping: dict[str, Any], *, label: str) -> None:
+    """Reject two semantics resolving to one physical Base column."""
+
+    physical_fields: dict[str, list[tuple[str, str, str]]] = {}
+    for semantic, configured in mapping.items():
+        owner = (
+            "human"
+            if semantic in _HUMAN_OWNED_FIELD_SEMANTICS
+            else "machine"
+            if semantic in _MACHINE_OWNED_FIELD_SEMANTICS
+            else "unspecified"
+        )
+        for field_name in _mapping_field_names(configured):
+            identity = _physical_field_identity(field_name)
+            if identity:
+                physical_fields.setdefault(identity, []).append(
+                    (owner, str(semantic), field_name)
+                )
+    for bindings in physical_fields.values():
+        semantics = sorted({semantic for _, semantic, _ in bindings})
+        if len(semantics) < 2:
+            continue
+        owners = {owner for owner, _, _ in bindings}
+        names = sorted({name for _, _, name in bindings}, key=str.casefold)
+        if owners == {"human", "machine"}:
+            human = sorted(
+                {semantic for owner, semantic, _ in bindings if owner == "human"}
+            )
+            machine = sorted(
+                {semantic for owner, semantic, _ in bindings if owner == "machine"}
+            )
+            raise ConfigError(
+                f"{label} ownership collision: human-owned {', '.join(human)} "
+                f"and machine-owned {', '.join(machine)} resolve to the same "
+                f"physical field ({' / '.join(names)})"
+            )
+        raise ConfigError(
+            f"{label} semantic collision: {', '.join(semantics)} resolve to the "
+            f"same physical field ({' / '.join(names)})"
+        )
+
+
+def _validate_field_mapping_ownership(mapping: dict[str, Any]) -> None:
+    """Validate flat People mappings and optional nested table mappings."""
+
+    _validate_one_field_mapping(mapping, label="field_mapping")
+    for table in ("People", "Sources"):
+        variants = [
+            value
+            for key in (table, table.casefold())
+            if isinstance((value := mapping.get(key)), dict)
+        ]
+        if len(variants) > 1:
+            raise ConfigError(
+                f"field_mapping contains duplicate nested {table} mappings"
+            )
+        if variants:
+            _validate_one_field_mapping(
+                variants[0], label=f"field_mapping.{table}"
+            )
+
+
+def authoritative_roster_source_ref(master: dict[str, Any]) -> str:
+    """Return a stable, non-secret identity for an existing Base roster.
+
+    Once generated, ``authoritative_source_ref`` is persisted in config and is
+    therefore preferred over a locator-derived value.  New configurations use
+    the canonical Base/table identity when it is available; draft OpenClaw
+    configurations fall back to a view-independent URL/table locator.
+    """
+
+    explicit = str(master.get("authoritative_source_ref") or "").strip()
+    if explicit:
+        return explicit
+    configured_id = str(
+        master.get("authoritative_roster_id") or master.get("config_id") or ""
+    ).strip()
+    base_token = str(master.get("base_token") or "").strip()
+    table_id = str(
+        master.get("people_table_id")
+        or master.get("table_id")
+        or master.get("people_table_name")
+        or master.get("table_name")
+        or "People"
+    ).strip()
+    if configured_id:
+        locator = f"config-id\0{configured_id}"
+    elif base_token:
+        locator = f"base-table\0{base_token}\0{table_id}"
+    else:
+        parsed = urlparse(str(master.get("url") or "").strip())
+        query = dict(parse_qsl(parsed.query, keep_blank_values=False))
+        url_table = str(query.get("table") or query.get("table_id") or table_id)
+        canonical_url = parsed._replace(
+            scheme=parsed.scheme.casefold(),
+            netloc=parsed.netloc.casefold(),
+            path=parsed.path.rstrip("/"),
+            params="",
+            query="",
+            fragment="",
+        ).geturl()
+        locator = f"base-url\0{canonical_url}\0{url_table}"
+    digest = hashlib.sha256(locator.encode("utf-8")).hexdigest()[:24]
+    return f"authoritative-base-{digest}"
+
+
+def _derived_source_ref(source: dict[str, Any]) -> str:
+    location = str(source.get("url") or source.get("path") or "").strip()
+    parsed = urlparse(location)
+    if parsed.scheme and parsed.netloc:
+        location = parsed._replace(
+            scheme=parsed.scheme.casefold(),
+            netloc=parsed.netloc.casefold(),
+            fragment="",
+        ).geturl()
+    locator = {
+        "kind": source.get("kind"),
+        "location": location,
+        "table": source.get("table_id") or source.get("table_name"),
+        "view": source.get("view_id") or source.get("view_name"),
+    }
+    encoded = json.dumps(locator, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return "source-" + hashlib.sha256(encoded.encode("utf-8")).hexdigest()[:24]
 
 
 @dataclass(frozen=True)
@@ -394,9 +580,17 @@ def validate_config(payload: dict[str, Any], *, require_complete: bool = False) 
     sources = payload.get("sources")
     if not isinstance(sources, list):
         raise ConfigError("sources must be a list")
+    source_refs: set[str] = set()
     for index, source in enumerate(sources):
         if not isinstance(source, dict) or source.get("kind") not in SOURCE_KINDS:
             raise ConfigError(f"sources[{index}] has an unsupported kind")
+        source_ref = str(source.get("source_ref") or "").strip()
+        if not source_ref:
+            source_ref = _derived_source_ref(source)
+        if len(source_ref) > 200 or source_ref in source_refs:
+            raise ConfigError(f"sources[{index}].source_ref must be unique and at most 200 chars")
+        source["source_ref"] = source_ref
+        source_refs.add(source_ref)
         location = source.get("url") or source.get("path")
         if not isinstance(location, str) or not location.strip():
             raise ConfigError(f"sources[{index}] needs url or path")
@@ -413,6 +607,7 @@ def validate_config(payload: dict[str, Any], *, require_complete: bool = False) 
     mapping = payload.get("field_mapping")
     if not isinstance(mapping, dict):
         raise ConfigError("field_mapping must be an object")
+    _validate_field_mapping_ownership(mapping)
     if require_complete and not mapping.get("name"):
         raise ConfigError("field_mapping.name is required")
     intake = payload.get("intake") or {}
@@ -426,27 +621,93 @@ def validate_config(payload: dict[str, Any], *, require_complete: bool = False) 
     if master.get("mode") == "existing_base":
         if not _is_feishu_url(str(master.get("url") or "")):
             raise ConfigError("master_database.url must be an HTTPS Feishu/Lark URL")
+        if master.get("authoritative_roster", True) is not True:
+            raise ConfigError(
+                "master_database.mode=existing_base must remain the authoritative roster"
+            )
+        source_ref = authoritative_roster_source_ref(master)
+        if not source_ref or len(source_ref) > 200:
+            raise ConfigError("master_database.authoritative_source_ref is invalid")
+        # v0.9 migration for already-written v1 configs.  Validation never
+        # dereferences the Base or reads credentials; it only fills stable,
+        # deterministic defaults in the in-memory config object.
+        master["authoritative_roster"] = True
+        master["authoritative_source_ref"] = source_ref
     outputs = payload.get("outputs")
     if not isinstance(outputs, dict):
         raise ConfigError("outputs must be an object")
-    message = outputs.get("message") or {"enabled": False}
-    if message.get("enabled"):
-        if message.get("target_kind") not in OUTPUT_TARGET_KINDS:
-            raise ConfigError("outputs.message.target_kind is invalid")
-        if message.get("target_kind") in {"chat", "user"} and not message.get("target_id"):
-            raise ConfigError("fixed message targets need target_id")
+    public_outputs = outputs.get("public") or {
+        "document": outputs.get("document") or {"enabled": False},
+        "message": outputs.get("message") or {"enabled": False},
+    }
+    developer_outputs = outputs.get("developer") or {"local_markdown": {"enabled": True}}
+    for audience, targets in (("public", public_outputs), ("developer", developer_outputs)):
+        if not isinstance(targets, dict):
+            raise ConfigError(f"outputs.{audience} must be an object")
+        message = targets.get("message") or {"enabled": False}
+        if message.get("enabled"):
+            if message.get("target_kind") not in OUTPUT_TARGET_KINDS:
+                raise ConfigError(f"outputs.{audience}.message.target_kind is invalid")
+            if message.get("target_kind") in {"chat", "user"} and not message.get("target_id"):
+                raise ConfigError(f"outputs.{audience} fixed message targets need target_id")
+    public_message = public_outputs.get("message") or {}
+    developer_message = developer_outputs.get("message") or {}
+    if (
+        public_message.get("enabled")
+        and developer_message.get("enabled")
+        and public_message.get("target_kind") == developer_message.get("target_kind")
+        and public_message.get("target_id") == developer_message.get("target_id")
+    ):
+        raise ConfigError("developer message target must not reuse the public report target")
+    review = payload.get("agent_review") or {}
+    if review.get("mode", "execution_agent") != "execution_agent":
+        raise ConfigError("agent_review.mode must be execution_agent")
+    if review.get("required_for_publish", True) is not True:
+        raise ConfigError("agent_review.required_for_publish must remain true")
+    if int(review.get("batch_size", 100)) not in range(1, 201):
+        raise ConfigError("agent_review.batch_size must be between 1 and 200")
+    scholar_policy = ((payload.get("scan_policy") or {}).get("scholar") or {})
+    if int(scholar_policy.get("max_requests_per_run", 8)) not in range(1, 101):
+        raise ConfigError("scan_policy.scholar.max_requests_per_run must be between 1 and 100")
+    if int(scholar_policy.get("max_requests_per_day", 64)) not in range(1, 501):
+        raise ConfigError("scan_policy.scholar.max_requests_per_day must be between 1 and 500")
+    if int(scholar_policy.get("max_requests_per_week", 448)) not in range(1, 2001):
+        raise ConfigError("scan_policy.scholar.max_requests_per_week must be between 1 and 2000")
+    if int(scholar_policy.get("max_requests_per_week", 448)) < int(
+        scholar_policy.get("max_requests_per_day", 64)
+    ):
+        raise ConfigError("Scholar weekly request budget must not be below the daily budget")
+    if int(scholar_policy.get("recovery_canary_requests", 1)) not in range(1, 11):
+        raise ConfigError(
+            "scan_policy.scholar.recovery_canary_requests must be between 1 and 10"
+        )
+    if int(scholar_policy.get("default_retry_after_hours", 24)) not in range(1, 169):
+        raise ConfigError(
+            "scan_policy.scholar.default_retry_after_hours must be between 1 and 168"
+        )
+    maximum_retry = int(scholar_policy.get("maximum_retry_after_hours", 168))
+    if maximum_retry not in range(1, 337):
+        raise ConfigError(
+            "scan_policy.scholar.maximum_retry_after_hours must be between 1 and 336"
+        )
+    if maximum_retry < int(scholar_policy.get("default_retry_after_hours", 24)):
+        raise ConfigError(
+            "scan_policy.scholar.maximum_retry_after_hours must not be below the default"
+        )
     _validate_schedule(payload.get("schedule"))
     apis = payload.get("apis") or {}
     deepseek = apis.get("deepseek") or {"enabled": False}
     if deepseek.get("enabled"):
-        _validate_secret_reference(deepseek.get("key_reference"), name="DeepSeek key_reference")
-        if not deepseek.get("key_reference"):
-            raise ConfigError("enabled DeepSeek requires key_reference")
-        if deepseek.get("model") != "deepseek-v4-flash":
-            raise ConfigError("portable release only enables deepseek-v4-flash")
+        raise ConfigError(
+            "DeepSeek review was removed in v0.9; use agent_review.mode=execution_agent"
+        )
     for index, api in enumerate(apis.get("search", [])):
         _validate_secret_reference(api.get("secret_reference"), name=f"search API {index}")
-    if require_complete and not sources:
+    has_authoritative_roster = (
+        master.get("mode") == "existing_base"
+        and master.get("authoritative_roster") is True
+    )
+    if require_complete and not sources and not has_authoritative_roster:
         raise ConfigError("at least one source is required before validation")
     return payload
 
@@ -482,7 +743,13 @@ def normalize_answers(payload: dict[str, Any]) -> dict[str, Any]:
             "lark_cli_identity_read": "user",
             "lark_cli_identity_write": "bot",
         },
-        "sources": payload.get("sources") or [],
+        "sources": [
+            {
+                **source,
+                "source_ref": source.get("source_ref") or f"source-{index + 1}",
+            }
+            for index, source in enumerate(payload.get("sources") or [])
+        ],
         "source_routes": (
             [] if payload.get("source_routes") is None else payload.get("source_routes")
         ),
@@ -499,11 +766,30 @@ def normalize_answers(payload: dict[str, Any]) -> dict[str, Any]:
             **(payload.get("master_database") or {}),
         },
         "outputs": {
-            "document": {"enabled": True, **((payload.get("outputs") or {}).get("document") or {})},
-            "message": {
-                "enabled": True,
-                "target_kind": "current_chat",
-                **((payload.get("outputs") or {}).get("message") or {}),
+            "public": {
+                "document": {
+                    "enabled": True,
+                    **(
+                        ((payload.get("outputs") or {}).get("public") or {}).get("document")
+                        or (payload.get("outputs") or {}).get("document")
+                        or {}
+                    ),
+                },
+                "message": {
+                    "enabled": True,
+                    "target_kind": "current_chat",
+                    **(
+                        ((payload.get("outputs") or {}).get("public") or {}).get("message")
+                        or (payload.get("outputs") or {}).get("message")
+                        or {}
+                    ),
+                },
+            },
+            "developer": {
+                "local_markdown": {"enabled": True},
+                "document": {"enabled": False},
+                "message": {"enabled": False},
+                **((payload.get("outputs") or {}).get("developer") or {}),
             },
         },
         "schedule": {
@@ -513,18 +799,37 @@ def normalize_answers(payload: dict[str, Any]) -> dict[str, Any]:
             "weekly_digest": "MON 08:30",
             **(payload.get("schedule") or {}),
         },
-        "apis": {
-            "deepseek": {
-                "enabled": False,
-                "model": "deepseek-v4-flash",
-                "max_calls_per_day": 100,
-                "max_total_tokens_per_day": 100000,
-                **((payload.get("apis") or {}).get("deepseek") or {}),
-            },
-            "search": (payload.get("apis") or {}).get("search") or [],
+        "agent_review": {
+            "mode": "execution_agent",
+            "required_for_publish": True,
+            "batch_size": 100,
+            **(payload.get("agent_review") or {}),
         },
+        "scan_policy": {
+            "scholar": {
+                "max_requests_per_run": 8,
+                "max_requests_per_day": 64,
+                "max_requests_per_week": 448,
+                "recovery_canary_requests": 1,
+                "default_retry_after_hours": 24,
+                "maximum_retry_after_hours": 168,
+                **(((payload.get("scan_policy") or {}).get("scholar") or {})),
+            },
+            **{
+                key: value
+                for key, value in (payload.get("scan_policy") or {}).items()
+                if key != "scholar"
+            },
+        },
+        "apis": {"search": (payload.get("apis") or {}).get("search") or []},
         "validation": {},
     }
+    if normalized["master_database"]["mode"] == "existing_base":
+        normalized["master_database"]["authoritative_roster"] = True
+        normalized["master_database"].setdefault(
+            "authoritative_source_ref",
+            authoritative_roster_source_ref(normalized["master_database"]),
+        )
     return validate_config(normalized)
 
 

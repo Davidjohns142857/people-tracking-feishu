@@ -364,7 +364,7 @@ def test_304_revalidates_stale_candidate_before_confirmation(tmp_path):
     tracker.close()
 
 
-def test_304_confirmation_runs_configured_summary_and_records_opportunity(tmp_path):
+def test_304_confirmation_never_calls_external_summary_reviewer(tmp_path):
     class SummaryReviewer:
         def __init__(self):
             self.calls = 0
@@ -373,7 +373,7 @@ def test_304_confirmation_runs_configured_summary_and_records_opportunity(tmp_pa
             self.calls += 1
             assert context["change_confirmed"] is True
             assert context["source_kind"] == "homepage"
-            decision.reviewer = "deepseek:deepseek-v4-flash:confirmed-summary"
+            decision.reviewer = "external-reviewer-should-not-run"
             decision.summary = "已确认变化摘要：新增一篇 ICLR 2026 论文。"
             return decision
 
@@ -382,7 +382,7 @@ def test_304_confirmation_runs_configured_summary_and_records_opportunity(tmp_pa
     _, first = observe(tracker, source, ADDED, etag='"v2"')
     reviewer = SummaryReviewer()
     usage: dict[str, int] = {}
-    run_id = tracker.start_run("304-deepseek-summary")
+    run_id = tracker.start_run("304-host-agent-review")
     second = tracker.observe(
         run_id,
         source["source_id"],
@@ -393,13 +393,9 @@ def test_304_confirmation_runs_configured_summary_and_records_opportunity(tmp_pa
     tracker.complete_run(run_id)
     assert first.status == "candidate"
     assert second.status == "changed"
-    assert second.reviewer.endswith(":confirmed-summary")
-    assert reviewer.calls == 1
-    assert usage == {
-        "confirmed_summary_eligible": 1,
-        "confirmed_summary_attempted": 1,
-        "confirmed_summary_completed": 1,
-    }
+    assert second.reviewer == "deterministic"
+    assert reviewer.calls == 0
+    assert usage == {}
     tracker.close()
 
 

@@ -17,12 +17,6 @@ from html.parser import HTMLParser
 from pathlib import Path
 from typing import Any
 
-from people_intel.deepseek_fallback import (
-    DEFAULT_LOCAL_CONFIG,
-    DeepSeekDiffReviewer,
-    DeepSeekPolicyError,
-    DeepSeekSettings,
-)
 from people_intel.light_tracker import (
     FetchObservation,
     LightTracker,
@@ -372,7 +366,10 @@ def _http_fetch(
                     body=None,
                     status_code=response.status,
                     final_url=response.url,
-                    content_type=response.headers.get_content_type(),
+                    content_type=(
+                        _header_value(response.headers, "Content-Type")
+                        or response.headers.get_content_type()
+                    ),
                     error=(
                         f"public response exceeds {MAX_HTTP_BODY_BYTES}-byte safety limit; "
                         "confirmed baseline preserved"
@@ -384,7 +381,10 @@ def _http_fetch(
                 body=body,
                 status_code=response.status,
                 final_url=response.url,
-                content_type=response.headers.get_content_type(),
+                content_type=(
+                    _header_value(response.headers, "Content-Type")
+                    or response.headers.get_content_type()
+                ),
                 etag=response.headers.get("ETag"),
                 last_modified=response.headers.get("Last-Modified"),
             )
@@ -411,8 +411,6 @@ def _http_fetch(
         if len(diagnostic_bytes) > HTTP_ERROR_PREFIX_LIMIT:
             diagnostic += "; body_prefix_truncated=true"
         content_type = _header_value(exc.headers, "Content-Type")
-        if content_type:
-            content_type = content_type.split(";", 1)[0].strip()
         return FetchObservation(
             body=None,
             status_code=exc.code,
@@ -1379,16 +1377,9 @@ def parser() -> argparse.ArgumentParser:
     imp.add_argument("--format", choices=("icml", "apple"), required=True)
     scan = commands.add_parser("scan-live")
     scan.add_argument("--person-key")
-    deepseek = scan.add_mutually_exclusive_group()
-    deepseek.add_argument(
-        "--deepseek", action="store_true", dest="deepseek", default=None
-    )
-    deepseek.add_argument(
-        "--no-deepseek", action="store_false", dest="deepseek"
-    )
-    scan.add_argument(
-        "--deepseek-config", type=Path, default=DEFAULT_LOCAL_CONFIG
-    )
+    # Kept as a hidden no-op so old scheduler invocations fail safe while
+    # upgrading.  There is intentionally no corresponding enable flag.
+    scan.add_argument("--no-deepseek", action="store_true", help=argparse.SUPPRESS)
     report = commands.add_parser("report")
     report.add_argument("run_id")
     linkedin_due = commands.add_parser("linkedin-due")
@@ -1561,20 +1552,6 @@ def main() -> None:
         elif args.command == "scan-live":
             run_id = tracker.start_run("cli-live")
             active_run_id = run_id
-            try:
-                settings = DeepSeekSettings.from_runtime(args.deepseek_config)
-                reviewer = (
-                    DeepSeekDiffReviewer.from_runtime(
-                        args.deepseek_config,
-                        required=args.deepseek is True,
-                    )
-                    if args.deepseek is not False
-                    else None
-                )
-            except (DeepSeekPolicyError, ValueError) as exc:
-                raise SystemExit(f"DeepSeek configuration rejected: {exc}") from exc
-            ai_usage: dict[str, int] = {}
-            usage_before = reviewer.usage_snapshot() if reviewer else {}
             for person in tracker.list_people():
                 if args.person_key and person["person_key"] != args.person_key:
                     continue
@@ -1585,23 +1562,15 @@ def main() -> None:
                         run_id,
                         source["source_id"],
                         _fetch(source),
-                        reviewer=reviewer,
-                        ai_usage_sink=ai_usage,
                     )
             tracker.complete_run(run_id)
             active_run_id = None
-            usage_after = reviewer.usage_snapshot() if reviewer else {}
-            usage_delta = {
-                key: max(0, int(usage_after.get(key, 0)) - int(usage_before.get(key, 0)))
-                for key in usage_after
-            }
             print(json.dumps({
                 "run_id": run_id,
-                "deepseek": {
-                    **settings.public_status(),
-                    "active_this_run": reviewer is not None,
-                    "opportunities": ai_usage,
-                    "usage_this_run": usage_delta,
+                "agent_review": {
+                    "mode": "execution_agent",
+                    "decision_authority": "skill_host_agent",
+                    "external_model_api_called": False,
                 },
                 "report": tracker.render_report(run_id),
             }, ensure_ascii=False, indent=2))

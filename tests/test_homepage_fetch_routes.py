@@ -52,7 +52,7 @@ def test_http_error_keeps_only_bounded_challenge_diagnostics(monkeypatch) -> Non
 
     assert observation.status_code == 403
     assert observation.body is None
-    assert observation.content_type == "text/html"
+    assert observation.content_type == "text/html; charset=UTF-8"
     assert "access_fingerprint=cloudflare_challenge" in observation.error
     assert "server=cloudflare" in observation.error
     assert "cf_mitigated=challenge" in observation.error
@@ -209,6 +209,55 @@ def test_success_body_over_limit_is_rejected_without_truncated_baseline(monkeypa
     assert health_status(observation, "homepage")[0] == "transport_error"
 
 
+def test_http_fetch_preserves_header_charset_for_legacy_profile(monkeypatch) -> None:
+    headers = Message()
+    headers["Content-Type"] = "text/html; charset=gb18030"
+    person_text = "张三的机器学习研究"
+    body = (
+        f"<html><head><title>{person_text}</title></head><body><main>"
+        f"<h1>{person_text}</h1><p>{person_text}，关注可靠评测系统。</p>"
+        "</main></body></html>"
+    ).encode("gb18030")
+
+    class Response:
+        status = 200
+        url = "https://example.com/legacy-profile"
+
+        def __init__(self):
+            self.headers = headers
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def read(self, limit):
+            assert limit == light_cli.MAX_HTTP_BODY_BYTES + 1
+            return body
+
+    monkeypatch.setattr(light_cli, "_public_urlopen", lambda *args, **kwargs: Response())
+    monkeypatch.setattr(
+        light_cli,
+        "_validate_public_url",
+        lambda value, *, resolve: str(value),
+    )
+
+    observation = light_cli._http_fetch(
+        "https://example.com/legacy-profile",
+        headers={"User-Agent": "public-monitor"},
+    )
+    snapshot = extract_snapshot(
+        "homepage", observation.body, content_type=observation.content_type,
+    )
+
+    assert observation.content_type == "text/html; charset=gb18030"
+    assert snapshot.extractor_version != "parser-anomaly-v1"
+    assert person_text in " ".join(
+        [*snapshot.identity.values(), *(item.text for item in snapshot.items)]
+    )
+
+
 def test_public_redirect_rejects_private_and_token_targets() -> None:
     handler = light_cli._SafePublicRedirect()
     request = urllib.request.Request("https://example.com/profile")
@@ -329,13 +378,6 @@ def test_scan_live_skips_disabled_sources(monkeypatch, tmp_path, capsys) -> None
         )
 
     monkeypatch.setattr(light_cli, "_fetch", fake_fetch)
-    monkeypatch.setattr(
-        light_cli.DeepSeekSettings,
-        "from_runtime",
-        lambda *args, **kwargs: type(
-            "Settings", (), {"public_status": lambda self: {}}
-        )(),
-    )
     monkeypatch.setattr(
         sys,
         "argv",

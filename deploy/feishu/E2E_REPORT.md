@@ -2,14 +2,17 @@
 
 ## 发布前离线验收
 
-- 全项目与便携层 pytest 由当次 CI/发布门重新执行；静态报告不保留会过期的计数。
+- 全项目与便携层 pytest 由本地发布门重新执行；仓库只提供可选 CI 模板，静态报告不保留会过期的计数。
 - 使用纯合成人物运行 Homepage `baseline → candidate → changed`。
 - 使用 fake `lark-cli 1.0.82` 验证 Base、Docs、消息全部先 dry-run，再实际写入。
 - 回读合成 Base/文档并验证消息幂等键。
 - 使用临时 HOME 验证 OpenClaw/Claude 双安装、重复安装、备份和回滚不修改预先存在的无关配置 hash。
-- DeepSeek 使用 fake transport 验证 `ambiguous_review` 与 `confirmed_summary`；不在发布构建中调用真实 key。
+- 用纯本地请求/决定文件验证 `people-tracking-agent-review-v1` 的 evidence hash、全量覆盖、重放与过期拒绝；测试和运行时都不调用外部评审模型。
+- 用模拟 429/Retry-After 验证 Scholar host circuit 跨进程保持、当轮停止、恢复 canary 和稳定周内错峰。
+- 用增删改恢复的合成 Base 记录验证 record_id/version hash 对账、分页不完整不推断删除、tombstone 保留历史及同表 read-before-write。
+- 分别验证用户报告不含内部错误词，开发者报告包含来源/解析诊断；任一投递失败不推进另一游标。
 
-可恢复 `bootstrap` 已覆盖直接导入、缺主页证据回填、OpenClaw 来源 bridge、可见总库 bridge、全量首次基线和重复恢复。包内自测与轻量跟踪对抗测试的当次结果以 CI/发布日志为准；详细门禁由 `INSTALLATION_REPORT.md` 记录。
+可恢复 `bootstrap` 已覆盖直接导入、缺主页证据回填、OpenClaw 来源 bridge、可见总库 bridge、受预算约束的首次基线和重复恢复；Scholar 未完成项可处于 `baseline_degraded`，并由后续 tick 继续修复。包内自测与轻量跟踪对抗测试的当次结果以 CI/发布日志为准；详细门禁由 `INSTALLATION_REPORT.md` 记录。
 
 ## 真实飞书私有沙箱
 

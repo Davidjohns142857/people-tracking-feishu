@@ -7,11 +7,6 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
-from people_intel.deepseek_fallback import (
-    DeepSeekDiffReviewer,
-    DeepSeekPolicyError,
-    DeepSeekSettings,
-)
 from people_intel.light_cli import _fetch
 from people_intel.light_tracker import FetchObservation, LightTracker
 from people_intel.person_profile_schemas import PersonDigestBatch
@@ -124,27 +119,6 @@ def run_once(
     try:
         sync = sync_profiles(service, tracker)
         due = due_sources(tracker, cadence_days=cadence_days)
-        try:
-            settings = DeepSeekSettings.from_env()
-            reviewer = DeepSeekDiffReviewer.from_env()
-            deepseek_status = settings.public_status()
-        except (DeepSeekPolicyError, ValueError) as exc:
-            reviewer = None
-            deepseek_status = {
-                "enabled": True,
-                "configured": False,
-                "key_value_returned": False,
-                "model_authority": {
-                    "ambiguous_review": "advisory_only",
-                    "confirmed_summary": "wording_only",
-                },
-                "errors": [f"{type(exc).__name__}: configuration rejected"],
-            }
-        usage_before = reviewer.usage_snapshot() if reviewer else {
-            "calls_last_24h": 0,
-            "tokens_last_24h": 0,
-            "completed_calls_last_7d": 0,
-        }
         observations: dict[str, FetchObservation] = {}
         with ThreadPoolExecutor(max_workers=max(1, workers)) as pool:
             futures = {pool.submit(_fetch, source): source for source in due}
@@ -162,14 +136,11 @@ def run_once(
 
         run_id = tracker.start_run("bundled-weekly-web-monitor")
         counts: dict[str, int] = {}
-        ai_usage: dict[str, int] = {}
         for source in due:
             decision = tracker.observe(
                 run_id,
                 source["source_id"],
                 observations[source["source_id"]],
-                reviewer=reviewer,
-                ai_usage_sink=ai_usage,
             )
             counts[decision.status] = counts.get(decision.status, 0) + 1
         tracker.complete_run(run_id)
@@ -186,7 +157,6 @@ def run_once(
             )
             service.ledger.append_person_digest_batch(digest)
             digest_batch_id = digest.digest_batch_id
-        usage_after = reviewer.usage_snapshot() if reviewer else usage_before
         return {
             "ok": True,
             "run_id": run_id,
@@ -195,17 +165,10 @@ def run_once(
             "decisions": dict(sorted(counts.items())),
             "reportable_people": len(reportable_people),
             "digest_batch_id": digest_batch_id,
-            "deepseek": {
-                **deepseek_status,
-                "opportunities": dict(sorted(ai_usage.items())),
-                "calls_this_run": max(
-                    0,
-                    usage_after["calls_last_24h"] - usage_before["calls_last_24h"],
-                ),
-                "tokens_this_run": max(
-                    0,
-                    usage_after["tokens_last_24h"] - usage_before["tokens_last_24h"],
-                ),
+            "agent_review": {
+                "mode": "execution_agent",
+                "decision_authority": "skill_host_agent",
+                "external_model_api_called": False,
             },
             "report": report,
         }

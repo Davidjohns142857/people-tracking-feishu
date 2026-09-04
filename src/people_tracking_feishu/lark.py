@@ -296,21 +296,11 @@ class LarkCli:
         fields: list[dict[str, Any]] = []
         if chosen:
             table_id = str(chosen.get("table_id") or chosen.get("id") or chosen.get("name"))
-            field_result = self.run(
-                [
-                    "base",
-                    "+field-list",
-                    "--base-token",
-                    token,
-                    "--table-id",
-                    table_id,
-                    "--as",
-                    identity,
-                    "--limit",
-                    "200",
-                ]
+            fields = self.list_base_fields(
+                base_token=token,
+                table_id=table_id,
+                identity=identity,
             )
-            fields = list(_record_list(result_data(field_result.payload), keys=("items", "fields")))
         return {
             "base_token": token,
             "base": result_data(base.payload),
@@ -318,6 +308,33 @@ class LarkCli:
             "selected_table": chosen,
             "fields": fields,
         }
+
+    def list_base_fields(
+        self,
+        *,
+        base_token: str,
+        table_id: str,
+        identity: str = "user",
+    ) -> list[dict[str, Any]]:
+        """Return the authoritative table schema before any record write."""
+
+        field_result = self.run(
+            [
+                "base",
+                "+field-list",
+                "--base-token",
+                base_token,
+                "--table-id",
+                table_id,
+                "--as",
+                identity,
+                "--limit",
+                "200",
+            ]
+        )
+        return list(
+            _record_list(result_data(field_result.payload), keys=("items", "fields"))
+        )
 
     def list_base_records(
         self,

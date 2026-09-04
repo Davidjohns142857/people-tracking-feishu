@@ -18,7 +18,36 @@ SECRET_PATTERNS = {
 }
 LOCAL_PATH = re.compile(rb"/(?:Users|home)/[A-Za-z0-9._-]+/")
 FORBIDDEN_SUFFIXES = {".sqlite", ".sqlite3", ".db", ".csv", ".tsv", ".jsonl", ".pem", ".key"}
-SKIP_PARTS = {".git", ".venv", "__pycache__", "dist", "build"}
+SKIP_PARTS = {".git", ".ruff_cache", ".venv", "__pycache__", "dist", "build"}
+MAX_AUDITED_FILE_BYTES = 8 * 1024 * 1024
+
+
+def audit_files(root: Path) -> list[str]:
+    failures: list[str] = []
+    for path in sorted(root.rglob("*")):
+        relative_path = path.relative_to(root)
+        if any(part in SKIP_PARTS for part in relative_path.parts):
+            continue
+        if path.is_symlink():
+            failures.append(f"symlink:{relative_path.as_posix()}")
+            continue
+        if not path.is_file():
+            continue
+        relative = relative_path.as_posix()
+        if path.suffix.casefold() in FORBIDDEN_SUFFIXES:
+            failures.append(f"forbidden:{relative}")
+            continue
+        size = path.stat().st_size
+        if size > MAX_AUDITED_FILE_BYTES:
+            failures.append(f"oversized:{relative}:{size}>{MAX_AUDITED_FILE_BYTES}")
+            continue
+        data = path.read_bytes()
+        if LOCAL_PATH.search(data):
+            failures.append(f"local_path:{relative}")
+        for name, pattern in SECRET_PATTERNS.items():
+            if pattern.search(data):
+                failures.append(f"secret:{relative}:{name}")
+    return failures
 
 
 def main() -> int:
@@ -50,23 +79,7 @@ def main() -> int:
     if handoff.get("release") != "@@VERSION@@":
         failures.append("agent handoff must use the build-time version placeholder")
 
-    for path in sorted(ROOT.rglob("*")):
-        if path.is_symlink():
-            failures.append(f"symlink:{path.relative_to(ROOT)}")
-            continue
-        if not path.is_file() or any(part in SKIP_PARTS for part in path.parts):
-            continue
-        relative = path.relative_to(ROOT).as_posix()
-        if path.suffix.casefold() in FORBIDDEN_SUFFIXES:
-            failures.append(f"forbidden:{relative}")
-            continue
-        data = path.read_bytes()
-        if len(data) <= 8 * 1024 * 1024:
-            if LOCAL_PATH.search(data):
-                failures.append(f"local_path:{relative}")
-            for name, pattern in SECRET_PATTERNS.items():
-                if pattern.search(data):
-                    failures.append(f"secret:{relative}:{name}")
+    failures.extend(audit_files(ROOT))
 
     print(json.dumps({"ok": not failures, "version": version, "failures": failures}, indent=2))
     return 0 if not failures else 2

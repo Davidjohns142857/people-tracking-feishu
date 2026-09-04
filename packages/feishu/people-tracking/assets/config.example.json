@@ -16,21 +16,37 @@
     }
   ],
   "field_mapping": {
-    "name": "Name",
-    "secondary_id": "External ID",
-    "aliases": "Aliases",
-    "school": "School",
-    "research_focus": "Research",
-    "stage": "Stage",
-    "homepage": "Homepage",
-    "scholar": "Scholar",
+    "person_key": "人员编号",
+    "record_type": "记录类型",
+    "name": "姓名",
+    "secondary_id": "第二ID",
+    "aliases": "别名",
+    "school": "学校/机构",
+    "research_focus": "专业/研究方向",
+    "stage": "阶段/年龄",
+    "employment_status": "任职状态",
+    "homepage": "个人主页",
+    "scholar": "Google Scholar",
     "github": "GitHub",
-    "linkedin": "LinkedIn"
+    "linkedin": "LinkedIn",
+    "sync_status": "同步状态",
+    "tracking_status": "跟踪状态",
+    "review_status": "审核状态",
+    "review_detail": "待确认信息",
+    "review_decision": "审核决定",
+    "managed_by": "管理方式"
   },
   "master_database": {"mode": "local_or_api"},
   "outputs": {
-    "document": {"enabled": true},
-    "message": {"enabled": true, "target_kind": "current_chat"}
+    "public": {
+      "document": {"enabled": true},
+      "message": {"enabled": true, "target_kind": "current_chat"}
+    },
+    "developer": {
+      "local_markdown": {"enabled": true},
+      "document": {"enabled": false},
+      "message": {"enabled": false}
+    }
   },
   "schedule": {
     "timezone": "Asia/Shanghai",
@@ -38,8 +54,20 @@
     "daily_digest": "18:00",
     "weekly_digest": "MON 08:30"
   },
-  "apis": {
-    "deepseek": {"enabled": false, "model": "deepseek-v4-flash"},
-    "search": []
-  }
+  "agent_review": {
+    "mode": "execution_agent",
+    "required_for_publish": true,
+    "batch_size": 100
+  },
+  "scan_policy": {
+    "scholar": {
+      "max_requests_per_run": 8,
+      "max_requests_per_day": 64,
+      "max_requests_per_week": 448,
+      "recovery_canary_requests": 1,
+      "default_retry_after_hours": 24,
+      "maximum_retry_after_hours": 168
+    }
+  },
+  "apis": {"search": []}
 }

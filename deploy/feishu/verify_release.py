@@ -21,6 +21,8 @@ FORBIDDEN_NAMES = {
     "client.json",
 }
 FORBIDDEN_SUFFIXES = {
+    ".pyc",
+    ".pyo",
     ".sqlite",
     ".sqlite3",
     ".db",
@@ -34,11 +36,19 @@ FORBIDDEN_SUFFIXES = {
     ".key",
 }
 FORBIDDEN_PARTS = {"__pycache__", ".git", ".venv", "node_modules", "artifacts", "inputs"}
+MAX_AUDITED_FILE_BYTES = 8 * 1024 * 1024
 SECRET_PATTERNS = {
     "deepseek_or_openai_key": re.compile(rb"\bsk-[A-Za-z0-9]{24,}\b"),
     "bearer_token": re.compile(rb"(?i)authorization\s*[:=]\s*bearer\s+[A-Za-z0-9._~+/=-]{16,}"),
     "feishu_app_secret": re.compile(rb"(?i)(?:app[_-]?secret)\s*[:=]\s*[\"']?[A-Za-z0-9_-]{20,}"),
     "private_key": re.compile(rb"-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----"),
+}
+FORBIDDEN_DEEPSEEK_RUNTIME_PATTERNS = {
+    "deepseek_endpoint": re.compile(rb"(?i)api\.deepseek\.com"),
+    "deepseek_environment": re.compile(rb"PEOPLE_INTEL_DEEPSEEK_"),
+    "deepseek_enable_flag": re.compile(rb"(?<!no-)--deepseek(?:[\s\"'])"),
+    "deepseek_runtime_module": re.compile(rb"(?i)deepseek_fallback"),
+    "deepseek_runtime_reviewer": re.compile(rb"(?i)DeepSeek(?:Diff)?Reviewer"),
 }
 LOCAL_PATH = re.compile(rb"/(?:Users|home)/[A-Za-z0-9._-]+/")
 
@@ -62,38 +72,62 @@ def verify(root: Path) -> dict[str, Any]:
     manifest_path = root / "release-manifest.json"
     if not manifest_path.is_file():
         raise ValueError("release-manifest.json is missing")
+    if manifest_path.stat().st_size > MAX_AUDITED_FILE_BYTES:
+        raise ValueError("release-manifest.json exceeds the safe verification size limit")
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     if manifest.get("manifest_version") != "people-tracking-feishu-release-v1":
         raise ValueError("unsupported release manifest version")
+    audit_policy = manifest.get("release_audit_policy") or {}
+    if (
+        audit_policy.get("content_scan_is_mandatory") is not True
+        or audit_policy.get("maximum_regular_file_bytes") != MAX_AUDITED_FILE_BYTES
+        or audit_policy.get("oversized_file_action") != "reject"
+    ):
+        raise ValueError("release manifest does not declare the required content-scan policy")
     expected = manifest.get("files")
     if not isinstance(expected, dict) or not expected:
         raise ValueError("manifest files map is empty")
     actual: dict[str, str] = {}
-    scan: dict[str, list[str]] = {"secrets": [], "local_paths": [], "forbidden": [], "symlinks": []}
+    scan: dict[str, list[str]] = {
+        "secrets": [],
+        "deepseek_runtime": [],
+        "local_paths": [],
+        "forbidden": [],
+        "oversized": [],
+        "symlinks": [],
+    }
     for path in sorted(root.rglob("*")):
         relative = path.relative_to(root).as_posix()
-        # Python may have imported a release module before verification.  Its
-        # bytecode cache is derived and excluded by the installer, so it is
-        # omitted from the manifest comparison and content scan.
-        if "__pycache__" in path.parts or path.suffix.casefold() in {".pyc", ".pyo"}:
-            continue
         if path.is_symlink():
             scan["symlinks"].append(relative)
             continue
         if not path.is_file() or relative == "release-manifest.json":
             continue
         lowered = path.name.casefold()
-        if lowered in FORBIDDEN_NAMES or path.suffix.casefold() in FORBIDDEN_SUFFIXES:
+        relative_parts = path.relative_to(root).parts
+        if (
+            lowered in FORBIDDEN_NAMES
+            or path.suffix.casefold() in FORBIDDEN_SUFFIXES
+            or any(part in FORBIDDEN_PARTS for part in relative_parts)
+        ):
             scan["forbidden"].append(relative)
-        if any(part in FORBIDDEN_PARTS for part in path.parts):
-            scan["forbidden"].append(relative)
+        size = path.stat().st_size
+        if size > MAX_AUDITED_FILE_BYTES:
+            scan["oversized"].append(
+                f"{relative}:{size}>{MAX_AUDITED_FILE_BYTES}"
+            )
+            actual[relative] = sha256(path)
+            continue
         data = path.read_bytes()
-        if len(data) <= 8 * 1024 * 1024:
-            for name, pattern in SECRET_PATTERNS.items():
+        for name, pattern in SECRET_PATTERNS.items():
+            if pattern.search(data):
+                scan["secrets"].append(f"{relative}:{name}")
+        if relative.startswith(("runtime/", "full-source/src/")):
+            for name, pattern in FORBIDDEN_DEEPSEEK_RUNTIME_PATTERNS.items():
                 if pattern.search(data):
-                    scan["secrets"].append(f"{relative}:{name}")
-            if LOCAL_PATH.search(data):
-                scan["local_paths"].append(relative)
+                    scan["deepseek_runtime"].append(f"{relative}:{name}")
+        if LOCAL_PATH.search(data):
+            scan["local_paths"].append(relative)
         actual[relative] = sha256(path)
     missing = sorted(set(expected) - set(actual))
     extra = sorted(set(actual) - set(expected))

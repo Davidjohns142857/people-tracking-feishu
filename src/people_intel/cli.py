@@ -137,7 +137,7 @@ def main(argv: list[str] | None = None) -> int:
 
     tracked_web = sub.add_parser(
         "tracked-web-scan",
-        help="Run one due-only deterministic webpage scan with a gated DeepSeek fallback",
+        help="Run one due-only deterministic webpage scan for host-agent review",
     )
     tracked_web.add_argument(
         "--state-db",
