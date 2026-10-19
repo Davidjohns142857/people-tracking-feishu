@@ -51,6 +51,8 @@ from .master import (
     visible_records,
 )
 from .reporting import markdown_http_url
+from .digest_editor import apply_editorial_review
+from .recovery import recovery_due
 from .sandbox import algorithm_e2e, feishu_e2e
 from .scheduler import openclaw_cron_plan
 from .state import PortableState, stable_hash
@@ -2980,6 +2982,36 @@ def command_digest(args: argparse.Namespace, paths: RuntimePaths) -> dict[str, A
             delivery = state.delivery(key) if key else None
             if not delivery:
                 raise ValueError("bridge result delivery_key is unknown")
+            targets = _audience_output_config(
+                config, str(delivery.get("audience") or "public")
+            )
+            tiered_weekly = (
+                delivery.get("audience") == "public"
+                and delivery.get("output_kind") == "weekly"
+                and (targets.get("message") or {}).get("enabled")
+            )
+            if tiered_weekly:
+                for field in ("doc_url", "message_id"):
+                    if (
+                        payload.get(field)
+                        and delivery.get(field)
+                        and str(payload[field]) != delivery[field]
+                    ):
+                        raise ValueError(
+                            "weekly receipt cannot replace a persisted document or message"
+                        )
+            if tiered_weekly and payload.get("message_id"):
+                editorial = state.get_meta("digest_editorial:" + key) or {}
+                if not editorial.get("items") or not delivery.get("doc_url"):
+                    raise ValueError(
+                        "weekly message receipt requires approved editorial plan "
+                        "and previously persisted full document"
+                    )
+                if (
+                    not editorial.get("message_hash")
+                    or payload.get("message_hash") != editorial["message_hash"]
+                ):
+                    raise ValueError("weekly message receipt must match the frozen message_hash")
             if payload.get("doc_url"):
                 state.update_delivery(
                     key,
@@ -2990,9 +3022,9 @@ def command_digest(args: argparse.Namespace, paths: RuntimePaths) -> dict[str, A
                 state.update_delivery(key, message_id=str(payload["message_id"]))
             delivery = state.delivery(key) or delivery
             targets = _audience_output_config(config, str(delivery.get("audience") or "public"))
-            document_done = not (targets.get("document") or {}).get("enabled") or bool(
-                delivery.get("doc_url")
-            )
+            document_done = not (
+                tiered_weekly or (targets.get("document") or {}).get("enabled")
+            ) or bool(delivery.get("doc_url"))
             message_done = not (targets.get("message") or {}).get("enabled") or bool(
                 delivery.get("message_id")
             )
@@ -3023,6 +3055,16 @@ def command_digest(args: argparse.Namespace, paths: RuntimePaths) -> dict[str, A
                 lark=cli,
             )
         return {"audience": audience, "reports": results}
+    finally:
+        state.close()
+
+
+def command_digest_review_apply(args: argparse.Namespace, paths: RuntimePaths) -> dict[str, Any]:
+    if load_config(paths).get("state") != "enabled":
+        raise ValueError("tracking is not enabled")
+    state = PortableState(paths.database)
+    try:
+        return apply_editorial_review(state, _json_file(args.input))
     finally:
         state.close()
 
@@ -3579,6 +3621,10 @@ def command_schedule_tick(args: argparse.Namespace, paths: RuntimePaths) -> dict
             config["schedule"],
             now=now,
         )
+        # A recovery queue wakes the normal due-only pipeline during the week,
+        # independently of the user's regular full scan cadence. Roster/master
+        # gates still run before any source access.
+        scan_is_due = scan_is_due or recovery_due(schedule_state, now=now)
         pending_source_bridge = schedule_state.get_meta("bridge_request:source_sync")
         pending_master_bridge = schedule_state.get_meta("bridge_request:master_sync")
         roster_checkpoint = schedule_state.get_meta("scheduler_roster_checkpoint")
@@ -4216,6 +4262,9 @@ def parser() -> argparse.ArgumentParser:
     digest.add_argument("--apply", action="store_true")
     digest.add_argument("--bridge-results", type=Path)
 
+    digest_review = commands.add_parser("digest-review-apply")
+    digest_review.add_argument("--input", type=Path, required=True)
+
     review_export = commands.add_parser("review-export")
     review_export.add_argument("--output", type=Path, required=True)
     review_export.add_argument("--lookback-days", type=int, default=8)
@@ -4250,6 +4299,7 @@ def main(argv: list[str] | None = None) -> int:
             "bootstrap": command_bootstrap,
             "scan": command_scan,
             "digest": command_digest,
+            "digest-review-apply": command_digest_review_apply,
             "review-export": command_review_export,
             "review-apply": command_review_apply,
             "doctor": command_doctor,

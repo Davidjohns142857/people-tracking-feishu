@@ -38,6 +38,7 @@ from people_tracking_feishu.reporting import (  # noqa: E402
 from people_tracking_feishu.sandbox import algorithm_e2e  # noqa: E402
 from people_tracking_feishu.scheduler import scheduler_artifacts  # noqa: E402
 from people_tracking_feishu.state import PortableState  # noqa: E402
+from people_tracking_feishu.digest_editor import apply_editorial_review  # noqa: E402
 import people_tracking_feishu.tracking as tracking_module  # noqa: E402
 
 
@@ -382,6 +383,26 @@ def main() -> int:
                     raise AssertionError("developer diagnostic leaked into user report")
                 if "HTTP 429 parser error while scanning" not in developer_report:
                     raise AssertionError("developer report lost the source diagnostic")
+                weekly_config = {"state": "enabled", "schedule": {"timezone": "Asia/Shanghai"},
+                                 "outputs": {"public": {"document": {"enabled": False}, "message": {"enabled": True}}}}
+                weekly = tracking_module.deliver_digest(state, paths, weekly_config, output_kind="weekly", apply=False, lark=None)
+                action = weekly["actions"][0]
+                if action["adapter"] != "execution_agent_digest_review":
+                    raise AssertionError("weekly delivery bypassed final Agent editorial pass")
+                editorial = json.loads(Path(action["request_file"]).read_text())
+                apply_editorial_review(state, {
+                    "schema_version": editorial["schema_version"], "request_id": editorial["request_id"],
+                    "delivery_key": editorial["delivery_key"], "decided_by": "execution-agent:offline-self-test",
+                    "items": [{"event_id": e["event_id"], "importance": 70, "summary": e["what_changed"], "award_note": ""} for e in editorial["events"]],
+                })
+                pending = tracking_module.deliver_digest(state, paths, weekly_config, output_kind="weekly", apply=False, lark=None)
+                if [a["operation"] for a in pending["actions"]] != ["create_document"]:
+                    raise AssertionError("weekly message did not wait for its full document")
+                state.update_delivery(weekly["delivery_key"], doc_url="https://synthetic.feishu.cn/docx/offline-full")
+                ready = tracking_module.deliver_digest(state, paths, weekly_config, output_kind="weekly", apply=False, lark=None)
+                message = ready["message_markdown"]
+                if "**论文" not in message or not message.endswith("[完整人员跟踪报告](https://synthetic.feishu.cn/docx/offline-full)"):
+                    raise AssertionError("weekly message lost paper grouping or its final full-document reference")
             finally:
                 state.close()
 

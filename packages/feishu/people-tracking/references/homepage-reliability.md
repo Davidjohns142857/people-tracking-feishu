@@ -48,6 +48,13 @@ HTTP(S)，不得含 credentials、token query、私网/本机 host 或非 80/443
 
 ## 严格复扫
 
+每个批次默认执行周中网络恢复：DNS/代理解析错误先限频刷新本机 resolver 缓存，再重试
+原固定 URL。缓存刷新仅使用固定无提权 OS 命令，结果需健康解析验证；无法处理的配置问题
+进入开发者队列，不猜测系统 DNS、代理或新 URL。DNS 故障仅提前 next_check_at 并保留原
+基线、候选和健康计数；连续五个域名失败时停止该轮后续访问。暂时传输失败在有界重试后
+也进入持久恢复队列，五轮耗尽转 needs_attention。调度每 15 分钟检查到期恢复任务，不受
+常规每周扫描间隔限制；禁用来源、Scholar 限额、429/证书/authwall 安全边界继续生效。
+
 ```bash
 python3 scripts/skill_entry.py scan --force-all --force-full-fetch \
   --source-kind homepage --homepage-retries 1 \
