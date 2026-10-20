@@ -6,6 +6,16 @@ OpenClaw 或 Claude Agent，以 SQLite 保存确认基线、候选变化、来�
 仓库只包含脱敏源码、测试、Skill、安装器和构建工具，不包含真实人员名单、网页快照、运行
 数据库、报告、Cookie 或凭证。GitHub Release 中的 ZIP 是飞书 Agent 的固定升级入口。
 
+## v0.10：分级周报与周中恢复
+
+`0.10.0-portable.1` 默认在整份已批准周报上执行最终 Agent 编排：优先突出创立/加入初创公司等
+Top10 重要非论文变化；论文按人物紧凑单列、注明有证据的奖项，其余变化按重要性简写。
+完整报告先写入独立飞书文档，聊天摘要最后引用；文档/审核失败时不提前发送，游标成功后才推进。
+
+每批采集自动诊断 DNS/代理解析与临时传输失败，限频刷新本机 DNS 缓存、有界重试并持久退避。
+恢复队列会在周中唤醒 15 分钟 OpenClaw tick，五轮耗尽转开发者处理；不修改系统 nameserver、
+代理、TLS/SSRF 安全门或启用状态，不把基础设施故障写成来源消失或人物变化。
+
 ## v0.9：增量名单、可靠解析与双报告
 
 `0.9.0-portable.1` 直接围绕用户现有飞书总表工作：
@@ -53,7 +63,7 @@ launchd/systemd，也不会把缺少 Agent 裁决能力的裸 `schedule-tick` �
 缺少 `.sha256` 时停止，不得解压、导入或执行包内任何 Python：
 
 ```bash
-release_version="0.9.0-portable.1"
+release_version="0.10.0-portable.1"
 archive="people-tracking-feishu-${release_version}.zip"
 checksum_file="${archive}.sha256"
 

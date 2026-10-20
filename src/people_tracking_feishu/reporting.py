@@ -1374,6 +1374,7 @@ def render_developer_report(
     events: list[dict[str, Any]],
     *,
     review_bundle_path: str,
+    recovery_queue: dict[str, Any] | None = None,
 ) -> str:
     counts: dict[str, int] = {}
     for event in events:
@@ -1395,6 +1396,14 @@ def render_developer_report(
         )
     else:
         lines.append("- 本窗口无运行事件。")
+    if recovery_queue:
+        lines.extend(["", "## 周中恢复队列", ""])
+        for sid, entry in sorted(recovery_queue.items()):
+            lines.append(
+                f"- {_markdown_plain_text(sid)} · {_markdown_plain_text(entry.get('kind'))} · "
+                f"{_markdown_plain_text(entry.get('status'))} · 尝试 {entry.get('attempts', 0)}/5 · "
+                f"下次 {_markdown_plain_text(entry.get('next_retry_at'))}"
+            )
     grouped = {
         "source_incident": "来源与解析异常",
         "candidate_or_review": "候选与绑定复核",
@@ -1408,6 +1417,9 @@ def render_developer_report(
         lines.extend(["", f"## {heading}", ""])
         for event in selected:
             payload = event["payload"]
+            recovery = (payload.get("metrics") or {}).get("network_recovery")
+            if recovery:
+                lines.append("- 周中网络恢复：" + _markdown_plain_text(json.dumps(recovery, ensure_ascii=False), limit=1500))
             person_name = _markdown_plain_text(payload.get("person_name"), limit=180)
             source_kind = _markdown_plain_text(payload.get("source_kind"), limit=100)
             try:

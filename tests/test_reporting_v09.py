@@ -151,7 +151,7 @@ def approve_pending_papers(state: PortableState) -> None:
         )
 
 
-def test_public_and_developer_reports_are_strictly_separated(tmp_path: Path) -> None:
+def test_public_and_developer_reports_are_strictly_separated(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     state, paths, config = runtime(tmp_path)
     try:
         _, source_id = add_person(state)
@@ -189,6 +189,11 @@ def test_public_and_developer_reports_are_strictly_separated(tmp_path: Path) -> 
         assert prepared["delivery"]["audience"] == "public"
         assert prepared["developer"]["delivery"]["audience"] == "developer"
 
+        # Delivery must remain in the report period being tested; wall-clock
+        # execution months later must not select a different daily report.
+        import people_tracking_feishu.tracking as tracking_module
+        original_prepare = tracking_module.prepare_digest
+        monkeypatch.setattr(tracking_module, "prepare_digest", lambda *a, **kw: original_prepare(*a, **kw, at=cutoff))
         result = deliver_digest(
             state,
             paths,

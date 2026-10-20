@@ -30,6 +30,8 @@ from .reporting import (
     write_agent_review_bundle,
 )
 from .state import PortableState
+from .digest_editor import editorial_action, render_tiered_message
+from .recovery import RecoveryManager, recoverable_kind
 
 
 _HOMEPAGE_RETRYABLE_STATUSES = {0, 408, 425, 500, 502, 503, 504}
@@ -147,6 +149,8 @@ def _homepage_error_text(observation: Any) -> str:
 def _homepage_retryable(observation: Any) -> bool:
     if observation.status_code not in _HOMEPAGE_RETRYABLE_STATUSES:
         return False
+    if recoverable_kind(observation) in {"dns_resolution", "proxy_dns_configuration"}:
+        return False  # diagnosed/repaired before the single infrastructure retry
     detail = _homepage_error_text(observation)
     return not any(marker in detail for marker in _HOMEPAGE_PERMANENT_ERROR_MARKERS)
 
@@ -594,8 +598,19 @@ def scan_due(
     homepage_retries = 0
     homepage_retry_wait_seconds = 0.0
     scholar_stopped = False
+    recovery = RecoveryManager(state, tracker_run)
     try:
         for source in sources:
+            if (
+                recovery.queue.get(source["source_id"], {}).get("status") == "needs_attention"
+                and not force_all
+                and source["source_id"] not in explicitly_selected
+            ):
+                recovery.metrics["attention_skipped"] += 1
+                continue
+            if recovery.circuit_open:
+                recovery.defer_after_circuit(source)
+                continue
             if source.get("kind") == "scholar" and scholar_stopped:
                 scholar_budget["deferred_after_limit"] += 1
                 continue
@@ -619,6 +634,7 @@ def scan_due(
                 )
                 homepage_retries += retries
                 homepage_retry_wait_seconds += waited
+                observation = recovery.recover(source, observation, _fetch)
             except Exception as exc:
                 observation_errors.append(
                     {
@@ -644,6 +660,16 @@ def scan_due(
                         config,
                         now=_parse_iso_time(observation.observed_at) or budget_now,
                     )
+            if recoverable_kind(observation) in {
+                "dns_resolution", "proxy_dns_configuration"
+            }:
+                recovery.finish(source, observation)
+                observation_errors.append({
+                    "source_id": source["source_id"], "kind": source["kind"],
+                    "phase": "infrastructure_deferred",
+                    "error_type": recoverable_kind(observation),
+                })
+                continue
             try:
                 decision = state.tracker.observe(
                     tracker_run,
@@ -664,6 +690,10 @@ def scan_due(
                     }
                 )
                 continue
+            recovery.finish(
+                source, observation,
+                healthy=decision.health_status == "healthy" and decision.quality_usable is True,
+            )
             if source.get("kind") == "scholar":
                 status_code = int(observation.status_code or 0)
                 # A half-open circuit is a parser/health canary, not merely an
@@ -759,6 +789,7 @@ def scan_due(
                 "review_opportunities": opportunities,
             },
             "scholar_budget": scholar_budget,
+            "network_recovery": recovery.metrics,
         }
         state.tracker.complete_run(
             tracker_run,
@@ -921,6 +952,7 @@ def _prepare_developer_digest(
         developer_window,
         events,
         review_bundle_path=str(review_path),
+        recovery_queue=state.get_meta("network_recovery_queue", {}),
     )
     report, report_path, report_ledger = _prepare_report_file(
         state,
@@ -1028,6 +1060,7 @@ def prepare_digest(
         developer_window,
         developer_events,
         review_bundle_path=str(review_path),
+        recovery_queue=state.get_meta("network_recovery_queue", {}),
     )
     developer_report, developer_report_path, developer_ledger = _prepare_report_file(
         state,
@@ -1155,6 +1188,13 @@ def _deliver_prepared(
     document = outputs.get("document") or {"enabled": False}
     message = outputs.get("message") or {"enabled": False}
     events = prepared.get("events") or []
+    tiered_weekly = (
+        audience == "public"
+        and (prepared.get("window") or {}).get("output_kind") == "weekly"
+        and message.get("enabled")
+    )
+    if tiered_weekly:
+        document = {**document, "enabled": True}
 
     # A public empty period advances its durable cursor but never creates an empty
     # document/message.  Developer local reports remain independently deliverable.
@@ -1208,11 +1248,25 @@ def _deliver_prepared(
                     doc_token=str(doc_token or ""),
                     status="document_created",
                 )
-    message_text = (
-        render_public_message(events, str(doc_url) if doc_url else None)
-        if audience == "public"
-        else _developer_message(prepared, str(doc_url) if doc_url else None)
-    )
+    if tiered_weekly and not doc_url:
+        return {
+            **prepared, "actions": actions, "status": "waiting_for_full_document",
+            "delivery": state.delivery(key),
+        }
+    if tiered_weekly:
+        message_text = render_tiered_message(events, prepared["editorial_items"], str(doc_url))
+    elif audience == "public":
+        message_text = render_public_message(events, str(doc_url) if doc_url else None)
+    else:
+        message_text = _developer_message(prepared, str(doc_url) if doc_url else None)
+    if tiered_weekly:
+        editorial = state.get_meta("digest_editorial:" + key)
+        message_hash = report_content_hash(message_text)
+        if editorial.get("message_hash") and editorial["message_hash"] != message_hash:
+            raise ValueError(
+                "weekly message is already frozen with a different document or content"
+            )
+        state.set_meta("digest_editorial:" + key, {**editorial, "message_hash": message_hash})
     if message.get("enabled"):
         target_kind = str(message.get("target_kind") or "current_chat")
         target_id = str(message.get("target_id") or "")
@@ -1226,6 +1280,9 @@ def _deliver_prepared(
                     "identity": "bot",
                     "idempotency_key": f"{key}:message",
                     "target": message,
+                    **({"message_hash": message_hash,
+                        "editorial_request_id": editorial["request_id"]}
+                       if tiered_weekly else {}),
                 }
             )
         else:
@@ -1273,6 +1330,16 @@ def deliver_digest(
         output_kind=output_kind,
         tracker_run_id=tracker_run_id,
     )
+    if (
+        output_kind == "weekly" and prepared["events"]
+        and (_audience_outputs(config, "public").get("message") or {}).get("enabled")
+    ):
+        action = editorial_action(state, paths, prepared)
+        if action:
+            return {**prepared, "status": "waiting_for_digest_editorial_review", "actions": [action]}
+        prepared["editorial_items"] = state.get_meta(
+            "digest_editorial:" + prepared["delivery_key"]
+        )["items"]
     return _deliver_prepared(
         state,
         config,

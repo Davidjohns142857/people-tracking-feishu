@@ -76,3 +76,7 @@ ref 或已消费 nonce 都会拒绝，不能用裸 `all_ok=true` 绕过。
 ```
 
 重试必须复用同一 delivery key；不得再次创建文档。
+
+周报消息采用两阶段投递：完整文档创建后先单独提交 `doc_url`，再次运行 digest 取得包含
+真实链接的消息，再提交 `message_id` 和消息 action 中的 `message_hash`。在文档回执前不得
+发送周报消息；审核未批准或 hash 不匹配时消息回执被拒绝，游标不推进。
