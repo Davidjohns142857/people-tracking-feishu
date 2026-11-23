@@ -17,6 +17,12 @@ automation 时停止，不覆盖。`claude_lark_cli` 仅支持交互执行并要
 `--skip-schedule`；不得安装 launchd/systemd 裸 tick，因为它无法消费 bridge 或使用宿主 token
 完成最终审核。
 
+每周的`execution_agent_career_search`同样在该宿主Agent回合内处理：读`payload_file`，
+使用已有公开搜索/网页工具，严格回填`career-search-apply --input FILE`，再恢复tick。
+它不调用新的模型API，不授权额外登录或付费服务，也不发送独立搜索进度消息。升级时须
+重载Skill并核对现有automation保存的message可消费该action；不要假设安装器自动覆盖
+原job，也不要通过另建同名作业造成重复扫描。
+
 用户和开发者投递各自使用 `audience + output_kind + time window` 幂等键及独立游标。若文档已创建而消息失败，记录 `document_created`，重试只发消息。一个 audience 的结果不得推进或冒充另一个 audience 完成。
 
 开发者报告必须披露来源失败、候选和未确认变化；用户报告只含已批准的重要人员事实。以下措辞禁止：
@@ -36,5 +42,11 @@ hostname 验证。证书过期、hostname mismatch 或链错误不得用 `-k`、
 
 严格复扫必须同时报告 enabled、planned、attempted、full-fetch planned/attempted、retry、
 健康分类和错误率。覆盖不足或错误率高于门限时不得发送“扫描成功”摘要。
+
+取证脚本在已校验的release解压目录`scripts/`内。`export_coverage_audit.py`默认仅导出匿名
+P/S/E/R及白名单状态，不含姓名、URL、正文、凭证或配置；它明确分开当前登记状态与截止前
+历史观测。`export_discovery_audit.py`可包含具体人物、来源和紧凑事实，只在已有相应数据
+读取授权时使用。两者要求显式时间窗口并创建新的0600输出文件；不得覆盖数据库或SQLite
+sidecar，不能以缺表、空库或旧本地库推断远程生产状态。详见[职业动态发现](career-discovery.md)。
 
 回滚只恢复本包建立的 Skill/launcher/service 备份。保留 SQLite、配置和报告，不删除用户数据。回滚完成后 `install-state.json` 标记为 `rolled_back`；重复回滚返回幂等 replay，不再次移动文件。安装中途失败必须报告真实 `mutated` 和 mutation 路径，并自动尽可能恢复 Skill/launcher。清理沙箱或 release 必须另行确认。

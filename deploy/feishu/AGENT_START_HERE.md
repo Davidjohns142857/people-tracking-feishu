@@ -18,6 +18,8 @@
 12. `bootstrap` 必须完成来源导入、缺主页分批补全、现有单表或 People/Sources 同步和预算内初始基线。只有 OpenClaw 注册隔离宿主 Agent automation；Claude + lark-cli 不得安装或宣称 launchd/systemd 裸调度可用。Scholar 延后项可返回 `baseline_degraded`，后续 Agent tick 或交互运行继续修复；不得为追求一次 ready 进行无界抓取。私有 `[TEST]` 写测仍只在用户单独确认后执行。
 13. OpenClaw automation 必须以 `--session isolated --message ... --no-deliver` 启动调用 `$people-tracking` 的宿主 Agent 回合，并持续消费 source/master/review/delivery action。每轮先完整读取权威 Base，再以 record_id/version hash 增量对账并只扫描到期或受影响来源；Base 读取、分页或 bridge 校验失败时 fail closed，不得使用旧 SQLite 扫描或发用户报告。普通名单编辑不得触发全量。升级验收才运行 `scan --force-all --force-full-fetch --source-kind homepage`。
 14. 报告前由当前 Agent 完整处理当前有上限的 `review-export` 快照并 `review-apply`，重复领取下一批直至没有请求。用户报告只写经批准、具体且重要的人员变化；所有错误、覆盖率、429 与待审状态只进入独立开发者报告。
+15. 周度`execution_agent_career_search`不是普通diff审核：读取`payload_file`，依照Skill的`references/career-discovery.md`使用已有公开搜索工具核实本批活跃人物的创业与任职动态，再以`career-search-apply --input FILE --json`回填并恢复tick。区分事件、公告与观察时间；搜索摘要不替代原始来源；未完成搜索不阻断其他已批准事实的周报。升级后重载Skill并检查已保存automation message支持该action，按原job ID维护，不新增重复cron。
+16. 需要生产证据时，已校验解压目录含`scripts/export_coverage_audit.py`和`scripts/export_discovery_audit.py`。二者仅用标准库只读既有数据库，显式传`--database`、带时区的`--since`/`--until`及新的`--output`文件；不导入runtime、不迁移、不联网、不扫描或投递。匿名覆盖与具体事实取证的内容权限不同，不要把旧本地库当目标机生产库。
 
 信任边界：ZIP 与 `.sha256` 来自同一个 GitHub Release，只能校验传输/存储完整性，不能独立认证发布者。当前 release 不包含 Sigstore 或 GitHub Artifact Attestation；信任根仍是 GitHub HTTPS、仓库发布权限和维护者的 tag/Release 管理。若要求独立发布者认证，在通过另一可信渠道取得 digest 或签名证明前停止安装。
 

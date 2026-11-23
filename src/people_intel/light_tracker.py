@@ -38,6 +38,33 @@ PARSER_ANOMALY_DETAIL_KEY = "parser_anomaly_detail"
 _MIN_REASONABLE_PUBLICATION_YEAR = 1900
 _MAX_FUTURE_PUBLICATION_YEARS = 2
 
+_CAREER_CLAIM = re.compile(
+    r"\b(?:(?:co[-\s]?)?founded|joined|appointed|promoted|resigned)\b"
+    r"[^.;,\n()。；，]{1,120}|"
+    r"\b(?:co[-\s]?founder|founder|founding member|CEO|CTO|COO|CFO|"
+    r"professor|scientist|engineer|researcher|intern|director|manager|postdoc)"
+    r"\s+(?:of|at|with|for|@)\s+[^.;,\n()。；，]{1,100}|"
+    r"\b(?:currently|now)\s+(?:at|with)\s+[^.;,\n()。；，]{1,100}|"
+    r"\b(?:started|launched)\s+(?:a|my|our|the)\s+(?:new\s+)?(?:company|startup)\b"
+    r"[^.;,\n()。；，]{0,100}|"
+    r"(?:联合创始人|创始人|创始成员|创立|创办|入职|加盟|加入|现任|任职于|就职于|"
+    r"担任|升任|晋升|离职|离任|卸任|开始创业|正在创业)[^.;,\n()。；，]{1,100}",
+    re.I,
+)
+_CAREER_ROLE = re.compile(
+    r"\b(co[-\s]?founder|founding member|CEO|CTO|COO|CFO|professor|scientist|"
+    r"engineer|researcher|intern|founder|director|manager|postdoc)\b|"
+    r"联合创始人|创始人|创始成员|教授|研究员|工程师|实习生|博士后|首席执行官|首席技术官",
+    re.I,
+)
+_CAREER_ROLE_FIELDS = {"title", "company", "employment_type", "start_date", "end_date"}
+_CAREER_ACADEMIC_YEAR = re.compile(
+    r"\b(?:first|second|third|fourth|fifth|sixth|seventh|eighth|ninth|"
+    r"1st|2nd|3rd|[4-9]th|year\s*[1-9]|[1-9](?:st|nd|rd|th))[-\s]*year\b|"
+    r"博士(?:一|二|三|四|五|六|七|八|九|[1-9])年级",
+    re.I,
+)
+
 
 class ParserQualityError(ValueError):
     """A bounded public response cannot be decoded without corrupting evidence."""
@@ -80,6 +107,94 @@ def normalize_key(value: str) -> str:
     value = normalize_text(value).casefold()
     value = re.sub(r"[^\w\u4e00-\u9fff]+", " ", value)
     return re.sub(r"\s+", " ", value).strip()
+
+
+def is_actionable_career_item(
+    *, action: str, item: dict[str, Any], source_kind: str
+) -> bool:
+    """Identify concrete career evidence for review, never a publication decision.
+
+    A bare disappearance, an ordinary paper or a generic mention of a startup
+    still uses the normal confirmation path. Historical corrections can qualify:
+    the execution Agent must decide what the evidence means and when it occurred.
+    """
+    if action not in {"addition", "modification"}:
+        return False
+    category = str(item.get("category") or "content")
+    before = str(item.get("before") or "")
+    after = str(item.get("after") or item.get("text") or "")
+    before_attributes = item.get("before_attributes") or {}
+    after_attributes = item.get("after_attributes") or item.get("attributes") or {}
+    if not isinstance(before_attributes, dict) or not isinstance(after_attributes, dict):
+        return False
+
+    def valid_change(old: str, new: str) -> bool:
+        old_key, new_key = normalize_key(old), normalize_key(new)
+        if not new_key or new_key == old_key or new_key in NOISE_TEXT:
+            return False
+        old_year = _CAREER_ACADEMIC_YEAR.sub('<year>', old)
+        new_year = _CAREER_ACADEMIC_YEAR.sub('<year>', new)
+        return not (
+            old_year != old and new_year != new
+            and normalize_key(old_year) == normalize_key(new_year)
+        )
+
+    if action == "modification":
+        field_name = str(item.get("field") or "")
+        if (
+            category == "identity"
+            and field_name in {"current_role", "current_company", "company", "jobTitle"}
+            and valid_change(before, after)
+        ):
+            return True
+        if category == "affiliation" and valid_change(before, after):
+            return True
+        if category == "position":
+            for field_name in _CAREER_ROLE_FIELDS:
+                new = normalize_key(str(after_attributes.get(field_name) or ""))
+                old = normalize_key(str(before_attributes.get(field_name) or ""))
+                if valid_change(old, new):
+                    return True
+        if category in {"identity", "position"} and valid_change(before, after):
+            old_roles = {normalize_key(match.group(0)) for match in _CAREER_ROLE.finditer(before)}
+            new_roles = {normalize_key(match.group(0)) for match in _CAREER_ROLE.finditer(after)}
+            if new_roles and new_roles != old_roles:
+                return True
+    elif category == "position" and (
+        any(valid_change('', str(after_attributes.get(field) or '')) for field in {"title", "company"})
+        or _CAREER_ROLE.search(after)
+        or source_kind == "linkedin" and normalize_key(after) not in NOISE_TEXT and normalize_key(after)
+    ):
+        return True
+    # A career fact can appear in biography/news prose or in a description cell,
+    # independently of the extractor's category and its displayed item text.
+    def claims(text: str, attributes: dict[str, Any]) -> set[str]:
+        evidence = " ".join((
+            text,
+            str(attributes.get("description") or ""),
+            str(attributes.get("summary") or ""),
+        ))
+        return {normalize_key(match.group(0)) for match in _CAREER_CLAIM.finditer(evidence)}
+
+    old_claims = claims(before, before_attributes) if action == "modification" else set()
+    new_claims = claims(after, after_attributes)
+    return bool(new_claims and new_claims != old_claims)
+
+
+def career_signal_item_key(action: str, item: dict[str, Any]) -> str:
+    """Stable current-fact key; an observed disappearance ends its occurrence."""
+    attributes = item.get("after_attributes") or item.get("attributes") or {}
+    payload = {
+        "action": action,
+        "category": str(item.get("category") or "content"),
+        "field": str(item.get("field") or ""),
+        "stable_id": str(item.get("after_stable_id") or item.get("stable_id") or ""),
+        "after": normalize_key(str(item.get("after") or item.get("text") or "")),
+        "attributes": {
+            str(key): normalize_key(str(value)) for key, value in attributes.items()
+        } if isinstance(attributes, dict) else {},
+    }
+    return _sha(json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")))
 
 
 def _declared_charsets(body: bytes, content_type: str | None) -> list[str]:
@@ -686,6 +801,10 @@ class ChangeDecision:
     # assessment (for example, a 304 or a transport failure). Callers must not
     # infer usability from HTTP success or health_status alone.
     quality_usable: bool | None = None
+    # These are evidence routes to the execution Agent, not confirmed changes.
+    # The ordinary snapshot/candidate transition remains independent.
+    actionable_signals: list[dict[str, Any]] = field(default_factory=list)
+    routed_career_items: list[dict[str, Any]] = field(default_factory=list)
 
 
 def _item(
@@ -2119,6 +2238,12 @@ class LightTracker:
           decision_status TEXT NOT NULL, score REAL NOT NULL, delta_json TEXT NOT NULL,
           summary TEXT NOT NULL, reviewer TEXT NOT NULL
         );
+        CREATE TABLE IF NOT EXISTS career_signal_routes (
+          source_id TEXT NOT NULL, item_key TEXT NOT NULL,
+          occurrence INTEGER NOT NULL, active INTEGER NOT NULL,
+          signal_id TEXT NOT NULL, first_observed_at TEXT NOT NULL,
+          PRIMARY KEY(source_id,item_key)
+        );
         CREATE TABLE IF NOT EXISTS relationships (
           relationship_id TEXT PRIMARY KEY, left_person_key TEXT NOT NULL,
           relation_type TEXT NOT NULL, right_person_key TEXT NOT NULL,
@@ -2485,6 +2610,75 @@ class LightTracker:
         self.db.commit()
         return run_id
 
+    def _route_actionable_career_signals(
+        self,
+        source_id: str,
+        kind: str,
+        decision: ChangeDecision,
+        observed_at: str,
+        *,
+        allow_new: bool,
+    ) -> None:
+        """Persist per-fact review routes within the observation savepoint.
+
+        Repeated whole-page candidates reuse the route. A healthy comparison in
+        which a fact is no longer a delta closes that occurrence, allowing a real
+        reversal/reappearance to be reviewed later with a different signal ID.
+        Conditional 304 observations may carry existing markers to confirmation,
+        but cannot invent a new first-seen fact or close an occurrence.
+        """
+        routed_keys: set[str] = set()
+        for action, items in (("addition", decision.additions), ("modification", decision.modifications)):
+            for item in items:
+                if not is_actionable_career_item(action=action, item=item, source_kind=kind):
+                    continue
+                key = career_signal_item_key(action, item)
+                if key in routed_keys:
+                    continue
+                routed_keys.add(key)
+                existing = self.db.execute(
+                    "SELECT * FROM career_signal_routes WHERE source_id=? AND item_key=?",
+                    (source_id, key),
+                ).fetchone()
+                fresh = existing is None or not existing["active"]
+                if fresh:
+                    if not allow_new:
+                        continue
+                    occurrence = int(existing["occurrence"] if existing else 0) + 1
+                    signal_id = "career_" + _sha(f"{source_id}|{key}|{occurrence}", 32)
+                    self.db.execute(
+                        """INSERT INTO career_signal_routes(
+                             source_id,item_key,occurrence,active,signal_id,first_observed_at
+                           ) VALUES(?,?,?,1,?,?)
+                           ON CONFLICT(source_id,item_key) DO UPDATE SET
+                             occurrence=excluded.occurrence,active=1,
+                             signal_id=excluded.signal_id,first_observed_at=excluded.first_observed_at""",
+                        (source_id, key, occurrence, signal_id, observed_at),
+                    )
+                    first_seen = observed_at
+                else:
+                    signal_id = existing["signal_id"]
+                    first_seen = existing["first_observed_at"]
+                signal = {
+                    "signal_id": signal_id,
+                    "action": action,
+                    "item": item,
+                    "first_observed_at": first_seen,
+                }
+                decision.routed_career_items.append(signal)
+                if fresh:
+                    decision.actionable_signals.append(signal)
+        if allow_new:
+            for row in self.db.execute(
+                "SELECT item_key FROM career_signal_routes WHERE source_id=? AND active=1",
+                (source_id,),
+            ).fetchall():
+                if row["item_key"] not in routed_keys:
+                    self.db.execute(
+                        "UPDATE career_signal_routes SET active=0 WHERE source_id=? AND item_key=?",
+                        (source_id, row["item_key"]),
+                    )
+
     def observe(
         self,
         run_id: str,
@@ -2587,6 +2781,7 @@ class LightTracker:
         health, detail = health_status(observation, source["kind"])
         record_timing("transport_health_gate", health_started)
         quality_payload: dict[str, Any] = {}
+        career_route_comparable = False
         extractor_version = old.extractor_version if old else None
 
         quarantined_candidate: FeatureSnapshot | None = None
@@ -2681,6 +2876,19 @@ class LightTracker:
                         or []
                     )
                 ]
+                if (
+                    authoritative_run
+                    and stored_quality.get("usable") is True
+                    and stored_quality.get("binding", {}).get("status") == "verified"
+                    and decision.status in {"unchanged", "noise", "changed"}
+                ):
+                    self._route_actionable_career_signals(
+                        source_id,
+                        source["kind"],
+                        decision,
+                        observation.observed_at,
+                        allow_new=False,
+                    )
 
                 if not authoritative_run:
                     if decision.status in {"changed", "ambiguous"}:
@@ -3113,6 +3321,7 @@ class LightTracker:
                     decision = compare_snapshots(old, snapshot)
                 decision.quality_score = quality_score
                 decision.quality_reasons = quality_reasons
+                career_route_comparable = decision.status in {"baseline", "unchanged", "noise", "changed"}
                 record_timing("snapshot_diff", diff_started)
 
                 transition_started = perf_counter()
@@ -3270,6 +3479,21 @@ class LightTracker:
                 )
         if "usable" in quality_payload:
             decision.quality_usable = quality_payload["usable"] is True
+        if (
+            authoritative_run
+            and career_route_comparable
+            and decision.health_status == "healthy"
+            and decision.quality_usable is True
+            and quality_payload.get("binding", {}).get("status") == "verified"
+            and decision.status in {"baseline", "unchanged", "noise", "candidate", "changed", "ambiguous"}
+        ):
+            self._route_actionable_career_signals(
+                source_id,
+                source["kind"],
+                decision,
+                observation.observed_at,
+                allow_new=observation.body is not None,
+            )
         persist_started = perf_counter()
         failed_health = decision.health_status != "healthy"
         failure_count = (
@@ -3302,6 +3526,8 @@ class LightTracker:
             "additions": decision.additions,
             "removals": decision.removals,
             "modifications": decision.modifications,
+            "actionable_signals": decision.actionable_signals,
+            "routed_career_items": decision.routed_career_items,
         }
         self.db.execute(
             """INSERT OR REPLACE INTO observations(

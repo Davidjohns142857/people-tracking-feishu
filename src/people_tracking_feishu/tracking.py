@@ -274,6 +274,7 @@ def _apply_scholar_run_budget(
     config: dict[str, Any],
     *,
     now: datetime,
+    persist_circuit: bool = True,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     """Apply a process-persistent host circuit and a bounded per-run budget."""
 
@@ -306,13 +307,14 @@ def _apply_scholar_run_budget(
             quota_allowance,
         )
         mode = "half_open"
-        state.update_host_budget(
-            _SCHOLAR_HOST_KEY,
-            circuit_state="half_open",
-            blocked_until=None,
-            canary_required=True,
-            reason="retry_window_elapsed_canary",
-        )
+        if persist_circuit:
+            state.update_host_budget(
+                _SCHOLAR_HOST_KEY,
+                circuit_state="half_open",
+                blocked_until=None,
+                canary_required=True,
+                reason="retry_window_elapsed_canary",
+            )
     else:
         allowance = min(policy["max_requests_per_run"], quota_allowance)
         mode = "closed"
@@ -344,6 +346,38 @@ def _apply_scholar_run_budget(
         "deferred_after_limit": 0,
         "stopped_on_429": False,
     }
+
+
+def _recovery_deferral(entry: dict[str, Any], *, now: datetime) -> str | None:
+    if entry.get("status") == "needs_attention":
+        return "attention_skipped"
+    if entry.get("status") == "pending":
+        retry_at = _parse_iso_time(entry.get("next_retry_at"))
+        if retry_at and retry_at > now:
+            return "retry_not_due"
+    return None
+
+
+def has_due_source_work(
+    state: PortableState, config: dict[str, Any], *, now: datetime
+) -> bool:
+    """Read-only scheduler probe for established, currently fetch-eligible work."""
+    queue = state.get_meta("network_recovery_queue", {})
+    due = []
+    for source in state.tracker.list_due_sources(as_of=now.isoformat()):
+        # Scholar can have never-checked rows left by an earlier batch's
+        # request limit. Let those drain between regular scans as budget opens.
+        if not source.get("last_checked_at") and source["kind"] != "scholar":
+            continue
+        if _recovery_deferral(queue.get(source["source_id"], {}), now=now):
+            continue
+        due.append(source)
+    if not due:
+        return False
+    eligible, _ = _apply_scholar_run_budget(
+        state, due, config, now=now, persist_circuit=False
+    )
+    return bool(eligible)
 
 
 def _record_scholar_attempt(
@@ -582,6 +616,18 @@ def scan_due(
             ),
         )
     budget_now = datetime.now(timezone.utc)
+    recovery = RecoveryManager(state, tracker_run)
+    recovery.metrics["retry_not_due"] = 0
+    if not force_all:
+        eligible = []
+        for source in selected_sources:
+            source_id = source["source_id"]
+            reason = _recovery_deferral(recovery.queue.get(source_id, {}), now=budget_now)
+            if reason and source_id not in explicitly_selected:
+                recovery.metrics[reason] += 1
+            else:
+                eligible.append(source)
+        selected_sources = eligible
     selected_sources, scholar_budget = _apply_scholar_run_budget(
         state, selected_sources, config, now=budget_now
     )
@@ -598,16 +644,8 @@ def scan_due(
     homepage_retries = 0
     homepage_retry_wait_seconds = 0.0
     scholar_stopped = False
-    recovery = RecoveryManager(state, tracker_run)
     try:
         for source in sources:
-            if (
-                recovery.queue.get(source["source_id"], {}).get("status") == "needs_attention"
-                and not force_all
-                and source["source_id"] not in explicitly_selected
-            ):
-                recovery.metrics["attention_skipped"] += 1
-                continue
             if recovery.circuit_open:
                 recovery.defer_after_circuit(source)
                 continue

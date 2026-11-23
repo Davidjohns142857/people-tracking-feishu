@@ -6,6 +6,23 @@ OpenClaw 或 Claude Agent，以 SQLite 保存确认基线、候选变化、来�
 仓库只包含脱敏源码、测试、Skill、安装器和构建工具，不包含真实人员名单、网页快照、运行
 数据库、报告、Cookie 或凭证。GitHub Release 中的 ZIP 是飞书 Agent 的固定升级入口。
 
+## v0.11：创业与任职动态发现
+
+`0.11.0-portable.1`在固定四类来源之外，由宿主Agent每周对过去365天有活动证据的活跃跟踪人物做公开网页检索，
+重点核实创立/加入初创公司、职位与任职单位变化。`schedule-tick`返回
+`execution_agent_career_search`及`payload_file`；Agent使用已有工具读取原始来源，按精确
+批次回填`career-search-apply --input FILE`，再恢复tick。无需另配模型API。
+
+发现仍进入标准事实审核，不直接发布；区分真实事件日期、公告日期与观察日期，跨周同一
+事实去重。工具不可用不等于没有变化，也不阻断其他已批准事实的周报。检索覆盖、失败和
+预算只进入开发者通道。完整契约见
+[`career-discovery.md`](packages/feishu/people-tracking/references/career-discovery.md)。
+
+这些能力需要目标机安装包含此改动的新Release并重载Skill；源码更新不会自动更换旧附件或
+已保存的automation message。先隔离名单验证，再小批正式验收，保留真实请求与回读证据。
+Release另带`scripts/export_coverage_audit.py`与`scripts/export_discovery_audit.py`，可在目标机
+以显式窗口只读导出匿名覆盖漏斗或具体发现证据，不触发扫描、同步或投递。
+
 ## v0.10：分级周报与周中恢复
 
 `0.10.0-portable.1` 默认在整份已批准周报上执行最终 Agent 编排：优先突出创立/加入初创公司等
@@ -63,7 +80,7 @@ launchd/systemd，也不会把缺少 Agent 裁决能力的裸 `schedule-tick` �
 缺少 `.sha256` 时停止，不得解压、导入或执行包内任何 Python：
 
 ```bash
-release_version="0.10.0-portable.1"
+release_version="0.11.0-portable.1"
 archive="people-tracking-feishu-${release_version}.zip"
 checksum_file="${archive}.sha256"
 
@@ -77,7 +94,7 @@ shasum -a 256 -c "${checksum_file}"
 只有 checksum 返回成功后，才解压并执行包内校验器：
 
 ```bash
-release_version="0.9.0-portable.1"
+release_version="0.11.0-portable.1"
 archive="people-tracking-feishu-${release_version}.zip"
 unzip "${archive}"
 cd "people-tracking-feishu-${release_version}"
