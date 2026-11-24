@@ -38,6 +38,10 @@
     "doctor": ["python3", "install_bundle.py", "--doctor"],
     "dry_run": ["python3", "install_bundle.py", "--dry-run"],
     "apply": ["python3", "install_bundle.py", "--apply"],
+    "upgrade_doctor": ["python3", "install_bundle.py", "--upgrade", "--doctor"],
+    "upgrade_dry_run": ["python3", "install_bundle.py", "--upgrade", "--dry-run"],
+    "upgrade_apply": ["python3", "install_bundle.py", "--upgrade", "--apply"],
+    "upgrade_resume": ["people-tracking-feishu", "upgrade-resume", "--json"],
     "onboarding": ["people-tracking-feishu", "onboarding", "--json"],
     "bootstrap": ["people-tracking-feishu", "bootstrap", "--confirmation", "确认启用", "--json"],
     "review_export": ["people-tracking-feishu", "review-export", "--output", "REVIEW_REQUESTS.json", "--json"],
@@ -55,7 +59,8 @@
     "scholar_policy": "fixed weekly phase plus per-run/day/week budgets, persistent 429 circuit, and half-open canary",
     "career_discovery_policy": "weekly bounded host-Agent public search for active people with past-year activity evidence; consume execution_agent_career_search.payload_file and career-search-apply; verified discoveries enter standard review, never direct publication; preserve event/source/observation dates and deduplicate across windows",
     "career_failure_policy": "search unavailable or unfinished is developer status, not proof of no change and not a gate on unrelated approved weekly facts",
-    "scheduler_upgrade_policy": "reload Skill/runtime and verify the existing isolated no-deliver automation can consume career search; saved messages do not update themselves and duplicate jobs must not be created"
+    "scheduler_upgrade_policy": "reload Skill/runtime and run upgrade-resume; refresh only the payload message on the existing job ID and verify unchanged schedule and delivery",
+    "existing_upgrade_policy": "reuse validated enabled config and database; no onboarding, bootstrap, user settings questions or blanket full scan; continue developer diagnostics without rolling back on provider/roster waits"
   },
   "confirmation_phrases": {
     "enable": "确认启用",

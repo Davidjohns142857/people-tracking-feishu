@@ -5,6 +5,8 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+from pathlib import Path
+from tempfile import NamedTemporaryFile
 from datetime import datetime, time, timedelta, timezone
 from zoneinfo import ZoneInfo
 
@@ -271,7 +273,12 @@ def prepare(state, config: dict, *, now: datetime, tick: dict | None = None) -> 
         return None
     target = recipient(config, settings)
     if not target:
-        return {"status": "developer_target_missing", "actions": []}
+        if not settings.get("use_existing_outputs"):
+            return {"status": "developer_target_missing", "actions": []}
+        document = config.get("outputs", {}).get("developer", {}).get("document") or {}
+        target = {"control_destination": "document", "document": document} if document.get("enabled") else {
+            "control_destination": "local"
+        }
     timezone_name = config["schedule"]["timezone"]
     first = state.delivery(FIRST)
     pending = state.db.execute(
@@ -309,12 +316,34 @@ def prepare(state, config: dict, *, now: datetime, tick: dict | None = None) -> 
         saved = state.get_meta(key)
     if saved["target"] != target:
         return {"status": "pending_target_changed", "actions": []}
+    destination = target.get("control_destination", "message")
+    report_path = ""
+    if destination in {"local", "document"}:
+        directory = state.path.parent / "reports" / "control-debug"
+        directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+        path = directory / (key.removeprefix("control-debug:") + ".md")
+        with NamedTemporaryFile(mode="w", encoding="utf-8", dir=directory, delete=False) as stream:
+            stream.write(saved["markdown"] + "\n")
+        Path(stream.name).replace(path)
+        report_path = str(path)
     delivery = state.prepare_delivery(
         key=key, output_kind="control_debug", period=key.removeprefix("control-debug:"),
-        title="人员跟踪 Debug 回执", report_path="", audience="developer",
+        title="人员跟踪 Debug 回执", report_path=report_path, audience="developer",
     )
     if delivery["status"] == "completed":
         return None
+    if destination == "local":
+        state.update_delivery(key, status="completed")
+        return {"status": "saved_to_existing_developer_reports", "delivery_key": key,
+                "report_path": report_path, "actions": []}
+    if destination == "document":
+        return {"status": "waiting_for_receipt", "delivery_key": key, "actions": [{
+            "adapter": "agent_tool_bridge", "operation": "create_document",
+            "audience": "developer", "target": target["document"], "identity": "bot",
+            "idempotency_key": key + ":doc", "delivery_key": key,
+            "message_hash": saved["message_hash"], "title": delivery["title"],
+            "markdown_file": report_path,
+        }]}
     return {"status": "waiting_for_receipt", "delivery_key": key, "actions": [{
         "adapter": "agent_tool_bridge", "operation": "send_current_or_configured_message",
         "audience": "developer", "target": target, "identity": "bot",
@@ -324,13 +353,23 @@ def prepare(state, config: dict, *, now: datetime, tick: dict | None = None) -> 
 
 
 def apply_receipt(state, payload: dict) -> dict:
-    if set(payload) != {"delivery_key", "message_id", "message_hash"}:
-        raise ValueError("debug receipt requires delivery_key, message_id and message_hash")
-    key, message_id = payload["delivery_key"], payload["message_id"]
+    key = payload.get("delivery_key")
     delivery = state.delivery(key) if isinstance(key, str) else None
     report = state.get_meta(key) if delivery and delivery["output_kind"] == "control_debug" else None
-    if not report or report["message_hash"] != payload["message_hash"]:
+    if not report or report["message_hash"] != payload.get("message_hash"):
         raise ValueError("debug receipt does not match a frozen delivery")
+    if report["target"].get("control_destination") == "document":
+        if set(payload) != {"delivery_key", "doc_url", "message_hash"}:
+            raise ValueError("debug document receipt requires delivery_key, doc_url and message_hash")
+        doc_url = payload["doc_url"]
+        if delivery["doc_url"] and delivery["doc_url"] != doc_url:
+            raise ValueError("debug receipt cannot replace a previous document")
+        return delivery if delivery["status"] == "completed" else state.update_delivery(
+            key, doc_url=doc_url, status="completed"
+        )
+    if set(payload) != {"delivery_key", "message_id", "message_hash"}:
+        raise ValueError("debug receipt requires delivery_key, message_id and message_hash")
+    message_id = payload["message_id"]
     if not isinstance(message_id, str) or not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", message_id):
         raise ValueError("debug receipt requires a valid message ID")
     if delivery["message_id"] and delivery["message_id"] != message_id:

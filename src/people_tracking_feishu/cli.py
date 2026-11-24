@@ -56,7 +56,7 @@ from .career_discovery import apply_weekly_career_search, prepare_weekly_career_
 from .digest_editor import apply_editorial_review
 from .recovery import recovery_due
 from .sandbox import algorithm_e2e, feishu_e2e
-from .scheduler import openclaw_cron_plan
+from .scheduler import openclaw_cron_plan, refresh_existing_openclaw
 from .state import PortableState, stable_hash
 from .tracking import (
     apply_agent_review_results,
@@ -1554,6 +1554,9 @@ def _runtime_mode(config: dict[str, Any] | None) -> str:
     requested = str(((config or {}).get("runtime") or {}).get("mode") or "auto")
     if requested in {"openclaw", "claude_lark_cli"}:
         return requested
+    preserved = os.environ.get("PEOPLE_TRACKING_FEISHU_UPGRADE_RUNTIME")
+    if config is not None and preserved in {"openclaw", "claude_lark_cli"}:
+        return preserved
     if shutil.which("openclaw") or Path("~/.openclaw").expanduser().exists():
         return "openclaw"
     return "claude_lark_cli"
@@ -1679,6 +1682,12 @@ def command_onboarding(args: argparse.Namespace, paths: RuntimePaths) -> dict[st
             "config": _public_config(enabled),
             "scheduler": scheduler,
             "next": "run sync --apply, then scan; preview sandbox-e2e before its apply step",
+        }
+    if config and config.get("state") == "enabled":
+        return {
+            "state": "enabled", "user_configuration_required": False,
+            "config": _public_config(config) if args.show else None,
+            "next": "continue existing execution; after an upgrade run upgrade-resume",
         }
     return {
         "state": config.get("state") if config else "not_started",
@@ -2986,6 +2995,8 @@ def command_digest(args: argparse.Namespace, paths: RuntimePaths) -> dict[str, A
             if not delivery:
                 raise ValueError("bridge result delivery_key is unknown")
             if delivery["output_kind"] == "control_debug":
+                if "doc_url" in payload:
+                    payload["doc_url"] = markdown_http_url(payload["doc_url"])
                 return {
                     "bridge_result_applied": True,
                     "delivery": debug_status.apply_receipt(state, payload),
@@ -3683,6 +3694,37 @@ def command_debug_status(args: argparse.Namespace, paths: RuntimePaths) -> dict[
         }
     finally:
         state.close()
+
+
+def command_upgrade_resume(args: argparse.Namespace, paths: RuntimePaths) -> dict[str, Any]:
+    config = load_config(paths)
+    if config.get("state") != "enabled":
+        return {"status": "existing_configuration_inactive", "user_configuration_required": False,
+                "actions": []}
+    state = PortableState(paths.database)
+    try:
+        now = datetime.now(timezone.utc)
+        settings = state.get_meta(debug_status.SETTINGS, {})
+        state.set_meta(debug_status.SETTINGS, {**settings, "enabled": True, "use_existing_outputs": True})
+        pending = debug_status.prepare(state, config, now=now) or {}
+        report = debug_status.status(state, now=now, timezone_name=config["schedule"]["timezone"])
+    finally:
+        state.close()
+    mode = _runtime_mode(config)
+    job = (
+        refresh_existing_openclaw(
+            Path(args.launcher or "~/.local/bin/people-tracking-feishu").expanduser(),
+            config_root=paths.config_root, state_root=paths.state_root,
+        )
+        if mode == "openclaw" else {"status": "existing_interactive_mode"}
+    )
+    return {
+        "status": "existing_configuration_resumed", "runtime_mode": mode,
+        "user_configuration_required": False, "scheduler": job, "control_debug": pending,
+        "existing_schedule_verified": job.get("status") in {"current", "refreshed"}
+        and job.get("enabled") is True,
+        "markdown": debug_status.markdown(report), "actions": pending.get("actions", []),
+    }
 
 
 def command_schedule_tick(args: argparse.Namespace, paths: RuntimePaths) -> dict[str, Any]:
@@ -4494,6 +4536,8 @@ def parser() -> argparse.ArgumentParser:
     career_search.add_argument("--input", type=Path, required=True)
 
     commands.add_parser("doctor")
+    resume = commands.add_parser("upgrade-resume", help="resume the existing configured runtime after upgrade")
+    resume.add_argument("--launcher", help=argparse.SUPPRESS)
 
     debug = commands.add_parser("debug-status", help="inspect production control-page and scan evidence")
     debug_mode = debug.add_mutually_exclusive_group()
@@ -4568,6 +4612,7 @@ def main(argv: list[str] | None = None) -> int:
             "review-apply": command_review_apply,
             "career-search-apply": command_career_search_apply,
             "doctor": command_doctor,
+            "upgrade-resume": command_upgrade_resume,
             "debug-status": command_debug_status,
             "sandbox-e2e": command_sandbox,
             "validation-profile": command_validation_profile,

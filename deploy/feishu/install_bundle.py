@@ -9,11 +9,14 @@ import platform
 import re
 import shlex
 import shutil
+import sqlite3
 import stat
 import subprocess
 import sys
 import tempfile
+import zipfile
 from datetime import datetime, timezone
+from time import monotonic
 from pathlib import Path
 from typing import Any
 
@@ -70,7 +73,7 @@ def tree_hash(root: Path) -> str:
     return digest.hexdigest()
 
 
-def secure_write(path: Path, content: str) -> None:
+def secure_write(path: Path, content: str, *, mode: int = 0o600) -> None:
     path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
     fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
@@ -79,12 +82,11 @@ def secure_write(path: Path, content: str) -> None:
             handle.write(content)
             handle.flush()
             os.fsync(handle.fileno())
-        temporary.chmod(0o600)
+        temporary.chmod(mode)
         os.replace(temporary, path)
     finally:
         if temporary.exists():
             temporary.unlink()
-    path.chmod(0o600)
 
 
 def _version(executable: str, args: list[str]) -> tuple[int, str]:
@@ -159,7 +161,9 @@ def find_lark_skills(home: Path) -> dict[str, str | None]:
     return found
 
 
-def dependency_report(args: argparse.Namespace, home: Path) -> dict[str, Any]:
+def dependency_report(
+    args: argparse.Namespace, home: Path, *, configured_mode: str | None = None
+) -> dict[str, Any]:
     python = choose_python(args.python)
     node_executable = shutil.which("node")
     node_code, node_output = _version(node_executable, ["--version"]) if node_executable else (127, "missing")
@@ -170,7 +174,9 @@ def dependency_report(args: argparse.Namespace, home: Path) -> dict[str, Any]:
     lark_version = _semver(lark_output)
     lark_ok = lark_code == 0 and lark_version == (1, 0, 82)
     openclaw = detect_openclaw_plugin()
-    runtime_mode = args.runtime_mode
+    if configured_mode and args.runtime_mode not in {"auto", configured_mode}:
+        raise RuntimeError("requested runtime differs from the existing configuration")
+    runtime_mode = configured_mode or args.runtime_mode
     if runtime_mode == "auto":
         runtime_mode = "openclaw" if openclaw.get("official_feishu_plugin") else "claude_lark_cli"
     skills = find_lark_skills(home)
@@ -274,8 +280,57 @@ def skill_destinations(home: Path) -> list[Path]:
     return destinations
 
 
+def runtime_roots(home: Path) -> tuple[Path, Path]:
+    return (
+        Path(os.environ.get("PEOPLE_TRACKING_FEISHU_CONFIG_ROOT", home / ".config/people-tracking-feishu")).expanduser().resolve(),
+        Path(os.environ.get("PEOPLE_TRACKING_FEISHU_STATE_ROOT", home / ".local/state/people-tracking-feishu")).expanduser().resolve(),
+    )
+
+
+def existing_setup(home: Path, *, require_upgrade: bool = False) -> dict[str, Any]:
+    config, state = runtime_roots(home)
+    config_path = config / "config.json"
+    database = state / "people-tracking.sqlite3"
+    if not config_path.exists() and not config_path.is_symlink():
+        if require_upgrade:
+            raise RuntimeError("upgrade requested but the existing config.json was not found; check the runtime roots")
+        return {"phase": "fresh", "config": str(config_path), "database": str(database)}
+    if config_path.is_symlink() or not config_path.is_file() or config_path.stat().st_mode & 0o077:
+        raise RuntimeError("existing config.json must be a private regular file")
+    try:
+        raw = config_path.read_bytes()
+        payload = json.loads(raw)
+        if not isinstance(payload, dict) or payload["schema_version"] != "people-tracking-config-v1":
+            raise ValueError
+        config_state = payload["state"]
+        if config_state not in {"enabled", "validated", "draft"}:
+            raise ValueError
+        mode = (payload.get("runtime") or {}).get("mode")
+        if mode not in {None, "auto", "openclaw", "claude_lark_cli"}:
+            raise ValueError
+    except (OSError, KeyError, TypeError, ValueError, AttributeError) as exc:
+        raise RuntimeError("existing configuration is invalid; keep it and verify the configured runtime roots") from exc
+    if require_upgrade and config_state != "enabled":
+        raise RuntimeError("upgrade requires the previously enabled configuration")
+    if config_state == "enabled" and (database.is_symlink() or not database.is_file()):
+        raise RuntimeError("enabled configuration has no existing database at its runtime root")
+    if mode in {None, "auto"}:
+        previous = home / ".config/people-tracking-feishu/install-state.json"
+        if previous.is_file() and not previous.is_symlink():
+            saved_mode = json.loads(previous.read_text(encoding="utf-8")).get("runtime_mode")
+            if saved_mode in {"openclaw", "claude_lark_cli"}:
+                mode = saved_mode
+    return {
+        "phase": "upgrade" if config_state == "enabled" else "configured_inactive",
+        "config": str(config_path), "database": str(database),
+        "config_sha256": hashlib.sha256(raw).hexdigest(),
+        "configured_mode": mode if mode in {"openclaw", "claude_lark_cli"} else None,
+    }
+
+
 def plan(args: argparse.Namespace, root: Path, home: Path) -> dict[str, Any]:
-    dependencies = dependency_report(args, home)
+    setup = existing_setup(home, require_upgrade=getattr(args, "upgrade", False))
+    dependencies = dependency_report(args, home, configured_mode=setup.get("configured_mode"))
     share = home / ".local" / "share" / "people-tracking-feishu"
     config = home / ".config" / "people-tracking-feishu"
     state = home / ".local" / "state" / "people-tracking-feishu"
@@ -299,6 +354,7 @@ def plan(args: argparse.Namespace, root: Path, home: Path) -> dict[str, Any]:
         "release": VERSION,
         "runtime_mode": dependencies["runtime_mode"],
         "dependencies": dependencies,
+        "existing_setup": setup,
         "paths": {
             "release": str(release),
             "config": str(config),
@@ -313,6 +369,80 @@ def plan(args: argparse.Namespace, root: Path, home: Path) -> dict[str, Any]:
         "rollback_state": str(config / "install-state.json"),
         "ready_to_apply": dependencies["ok"] and bool(skills),
     }
+
+
+def check_existing_runtime(root: Path, setup: dict[str, Any], python: str) -> dict[str, Any]:
+    """Validate the legacy config and exercise the new schema on a SQLite copy."""
+    if setup["phase"] == "fresh":
+        return {"status": "fresh_install"}
+    config = Path(setup["config"])
+    content = config.read_bytes()
+    if hashlib.sha256(content).hexdigest() != setup["config_sha256"]:
+        raise RuntimeError("existing configuration changed after upgrade planning; rerun the installer")
+    wheels = sorted((root / "vendor" / "wheels").glob("*.whl"))
+    env = {k: v for k, v in os.environ.items() if not k.startswith("PYTHON")}
+    env.update(PYTHONDONTWRITEBYTECODE="1", PYTHONNOUSERSITE="1")
+    code = """
+import json, sys
+from pathlib import Path
+from people_tracking_feishu import __version__
+from people_tracking_feishu.config import validate_config
+from people_tracking_feishu.state import PortableState
+
+try:
+    config = validate_config(json.loads(Path(sys.argv[1]).read_text()))
+    if sys.argv[2]:
+        state = PortableState(Path(sys.argv[2]))
+        try:
+            assert state.db.execute("PRAGMA quick_check").fetchone()[0] == "ok"
+            state.status()
+        finally:
+            state.close()
+except Exception as exc:
+    print(json.dumps({"ok": False, "error_type": type(exc).__name__}))
+    raise SystemExit(2)
+print(json.dumps({"ok": True, "version": __version__, "state": config["state"]}))
+"""
+    with tempfile.TemporaryDirectory(prefix="people-tracking-upgrade-check-") as tmp:
+        wheel_runtime = Path(tmp) / "wheels"
+        wheel_runtime.mkdir()
+        for wheel in wheels:
+            with zipfile.ZipFile(wheel) as archive:
+                archive.extractall(wheel_runtime)
+        # pypinyin reads JSON dictionaries using normal filesystem paths.
+        env["PYTHONPATH"] = os.pathsep.join(map(str, (root / "runtime", wheel_runtime)))
+        private_config = Path(tmp) / "config.json"
+        secure_write(private_config, content.decode("utf-8"))
+        snapshot = ""
+        if setup["phase"] == "upgrade":
+            database = Path(setup["database"])
+            snapshot = str(Path(tmp) / "compat.sqlite3")
+            deadline = monotonic() + 45
+
+            def check_deadline(*_):
+                if monotonic() > deadline:
+                    raise RuntimeError("timed out obtaining a read-only database snapshot for upgrade")
+
+            source = sqlite3.connect(database.as_uri() + "?mode=ro", uri=True, timeout=5)
+            target = sqlite3.connect(snapshot)
+            try:
+                source.backup(target, pages=128, progress=check_deadline)
+            finally:
+                target.close()
+                source.close()
+        probe = subprocess.run([python, "-P", "-c", code, str(private_config), snapshot],
+                               env=env, capture_output=True, text=True, timeout=90, check=False)
+        try:
+            result = json.loads(probe.stdout)
+        except json.JSONDecodeError:
+            result = {}
+        if probe.returncode or not result.get("ok") or result.get("version") != VERSION:
+            raise RuntimeError(
+                "existing config/database failed compatibility checks before activation"
+                + (f" ({result['error_type']})" if result.get("error_type") else "")
+            )
+    return {"status": "compatible", "config_state": result["state"],
+            "database_snapshot_migrated": bool(snapshot)}
 
 
 def _copy_tree(source: Path, destination: Path) -> None:
@@ -440,9 +570,11 @@ def _install_skill(source: Path, destination: Path) -> dict[str, Any]:
 def _apply_install_unchecked(args: argparse.Namespace, root: Path, home: Path, preview: dict[str, Any]) -> dict[str, Any]:
     if not preview["ready_to_apply"]:
         raise RuntimeError("dependencies are not ready; no installation changes were made")
+    setup = preview["existing_setup"]
+    selected_python = str(preview["dependencies"]["python"]["selected"])
+    compatibility = check_existing_runtime(root, setup, selected_python)
     self_test = offline_self_test(
-        root,
-        str(preview["dependencies"]["python"]["selected"]),
+        root, selected_python,
     )
     release = Path(preview["paths"]["release"])
     config = Path(preview["paths"]["config"])
@@ -504,12 +636,17 @@ def _apply_install_unchecked(args: argparse.Namespace, root: Path, home: Path, p
     launcher.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     launcher_backup = None
     launcher_changed = False
+    runtime_binding = (
+        f"export PEOPLE_TRACKING_FEISHU_UPGRADE_RUNTIME={shlex.quote(preview['runtime_mode'])}\n"
+        if setup["phase"] == "upgrade" else ""
+    )
     launcher_content = (
         "#!/bin/sh\n"
         "unset PYTHONHOME\n"
         "export PYTHONDONTWRITEBYTECODE=1\n"
         "export PYTHONNOUSERSITE=1\n"
         "export PYTHONSAFEPATH=1\n"
+        f"{runtime_binding}"
         f"export PYTHONPATH={shlex.quote(str(release / 'runtime'))}\n"
         f"exec {shlex.quote(str(venv / 'bin' / 'python'))} -P -m people_tracking_feishu.cli \"$@\"\n"
     )
@@ -517,11 +654,11 @@ def _apply_install_unchecked(args: argparse.Namespace, root: Path, home: Path, p
         current = launcher.read_text(encoding="utf-8")
         if current != launcher_content:
             launcher_backup = _backup_name(launcher)
-            launcher.rename(launcher_backup)
+            shutil.copy2(launcher, launcher_backup)
+            secure_write(launcher, launcher_content, mode=0o700)
             launcher_changed = True
     if not launcher.exists():
-        secure_write(launcher, launcher_content)
-        launcher.chmod(0o700)
+        secure_write(launcher, launcher_content, mode=0o700)
         launcher_changed = True
     if launcher_backup is None:
         launcher_backup = (
@@ -548,13 +685,19 @@ def _apply_install_unchecked(args: argparse.Namespace, root: Path, home: Path, p
         "launcher_changed": launcher_changed,
         "skills": skills,
         "runtime_mode": preview["runtime_mode"],
-        "scheduled_jobs": [],
+        "scheduled_jobs": previous_state.get("scheduled_jobs", []),
         "external_config_modified": False,
         "secrets_read": False,
     }
     secure_write(install_state_path, json.dumps(install_state, ensure_ascii=False, indent=2) + "\n")
+    if setup["phase"] != "fresh":
+        smoke_argv = [str(launcher), "upgrade-resume", "--help"]
+    else:
+        runtime_config, runtime_state = runtime_roots(home)
+        smoke_argv = [str(launcher), "--config-root", str(runtime_config),
+                      "--state-root", str(runtime_state), "doctor", "--json"]
     smoke = subprocess.run(
-        [str(launcher), "doctor", "--json"],
+        smoke_argv,
         capture_output=True,
         text=True,
         timeout=60,
@@ -562,14 +705,28 @@ def _apply_install_unchecked(args: argparse.Namespace, root: Path, home: Path, p
     )
     if smoke.returncode != 0:
         detail = (smoke.stderr or smoke.stdout).strip()[-2000:]
-        raise RuntimeError(f"installed launcher doctor failed: {detail}")
+        raise RuntimeError(f"installed launcher smoke failed: {detail}")
+    if setup["phase"] == "upgrade":
+        next_step = "reload Skill, then run people-tracking-feishu upgrade-resume --json in the same Agent"
+    elif setup["phase"] == "configured_inactive":
+        next_step = "reload Skill; retain the existing inactive configuration"
+    else:
+        next_step = "reload Skill, then run people-tracking-feishu onboarding --json"
     return {
         "installed": True,
         "state": install_state,
         "offline_self_test": self_test,
-        "doctor": json.loads(smoke.stdout),
+        "doctor": json.loads(smoke.stdout) if setup["phase"] == "fresh" else compatibility,
+        "installation_phase": setup["phase"],
+        "compatibility": compatibility,
+        "user_configuration_required": setup["phase"] == "fresh",
+        "resume_argv": [
+            str(launcher), "--config-root", str(Path(setup["config"]).parent),
+            "--state-root", str(Path(setup["database"]).parent),
+            "upgrade-resume", "--launcher", str(launcher), "--json",
+        ] if setup["phase"] == "upgrade" else None,
         "restart_agent_required": True,
-        "next": "restart/reload skills, then run people-tracking-feishu onboarding --json",
+        "next": next_step,
     }
 
 
@@ -816,6 +973,9 @@ def parser() -> argparse.ArgumentParser:
     action.add_argument("--apply", action="store_true")
     action.add_argument("--rollback", action="store_true")
     root.add_argument("--home", type=Path, default=Path.home())
+    root.add_argument("--upgrade", action="store_true", help="require and retain an existing enabled configuration")
+    root.add_argument("--config-root", type=Path, help="reuse the active runtime's custom configuration root")
+    root.add_argument("--state-root", type=Path, help="reuse the active runtime's custom state root")
     root.add_argument("--python")
     root.add_argument("--lark-cli")
     root.add_argument("--runtime-mode", choices=("auto", "openclaw", "claude_lark_cli"), default="auto")
@@ -824,6 +984,10 @@ def parser() -> argparse.ArgumentParser:
 
 def main() -> int:
     args = parser().parse_args()
+    if args.config_root is not None:
+        os.environ["PEOPLE_TRACKING_FEISHU_CONFIG_ROOT"] = str(args.config_root)
+    if args.state_root is not None:
+        os.environ["PEOPLE_TRACKING_FEISHU_STATE_ROOT"] = str(args.state_root)
     root = Path(__file__).resolve().parent
     home = args.home.expanduser().resolve()
     try:

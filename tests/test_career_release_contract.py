@@ -53,7 +53,7 @@ def test_isolated_host_prompt_consumes_career_action_without_bypassing_review(tm
 def test_release_version_and_handoff_expose_consistent_upgrade_contract():
     version = (ROOT / "VERSION").read_text().strip()
     package = tomllib.loads((ROOT / "pyproject.toml").read_text())
-    assert version == "0.11.0-portable.1"
+    assert version == "0.11.0-portable.2"
     assert package["project"]["version"] == version.split("-portable.")[0]
     readme = (ROOT / "README.md").read_text()
     assert readme.count('release_version="' + version + '"') == 2

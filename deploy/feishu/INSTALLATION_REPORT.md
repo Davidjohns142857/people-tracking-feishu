@@ -48,6 +48,9 @@
 
 ## 目标机最终门
 
-目标 Agent 仍必须完成：在解压或执行包内 Python 前用包外同名 `.sha256` 校验 ZIP、解压后运行包内 manifest 校验、doctor/dry-run、一次性问卷、只读 source probe、“确认启用”、`bootstrap status=ready`、私有 `[TEST]` E2E 和真实回读。OpenClaw 还必须验证隔离宿主 Agent automation 能连续消费 source/master/review/delivery action；Claude + lark-cli 必须显式 `--skip-schedule` 并向用户说明仅交互运行。安装验证成功时可按交接 Prompt 直接 apply；首次入库之后不得停在任何 `waiting_for_*` bridge 状态。未得到对象 token、文档 URL、message ID 与 readback 前，不得把真实飞书 E2E 标为通过。
+目标 Agent 先完成包外 checksum、包内 manifest 校验和 doctor/dry-run。已有启用配置在隔离数据库副本
+校验通过后，重载 Skill 并执行 `resume_argv`，复用原配置、名单、调度与输出。首次安装才进入问卷、
+source probe、“确认启用”和 bootstrap；Claude + lark-cli 首次 bootstrap 传 `--skip-schedule`。
+只有获得实际投递和回读证据，才标记真实飞书环节通过。
 
 安全边界：包不含真实名单、历史快照、数据库、secret、本机路径；安装器不联网安装外部依赖，不改写现有飞书/OpenClaw/Claude 配置，不在首次确认前注册调度。同一 GitHub Release 中的 ZIP 与 `.sha256` 只能证明传输/存储完整性，不能独立认证发布者；当前模板不包含 Sigstore 或 GitHub Artifact Attestation。

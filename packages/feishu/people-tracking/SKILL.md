@@ -21,6 +21,12 @@ description: Configure, incrementally maintain, monitor, review, and report a po
 9. 持续自动运行仅支持 OpenClaw automation。`claude_lark_cli` 只能交互执行，bootstrap 必须
    显式传 `--skip-schedule`；不得安装 launchd/systemd 裸 tick 或声称它能完成 Agent 审核。
 
+## 已有系统升级
+
+已有启用配置时，重载 Skill 后直接执行安装器返回的 `resume_argv`，复用配置、名单、来源、SQLite、
+审核、报告游标与原调度任务。执行返回的开发者 debug 动作；若本次仅保存在本地，直接在升级私聊回复
+返回的 `markdown`。普通等待或来源失败按已有策略处理，不重新配置、全量扫描或回退版本。
+
 ## 首次配置
 
 运行：
@@ -238,7 +244,8 @@ python3 scripts/skill_entry.py schedule-tick --json
 
 ## 持续控制主页验证
 
-部署负责人要求启用线上 debug 回执时，升级后立即执行 `debug-status --enable --json`，处理返回的
+已启用系统通过 `upgrade-resume --json` 自动继承既有开发者通道。单独启用固定消息投递时，可运行
+`debug-status --enable --json`，处理返回的
 developer 消息动作，并用 `digest --bridge-results FILE --json` 回填真实收件回执。无需等下一次扫描。
 已有固定 developer 收件人时直接复用；否则在当前私聊中把返回的 markdown 原样回复，常规自动投递
 需要负责人指定独立开发者收件人。常规回执使用现有调度，每周一 08:00、周四 20:00（部署时区）。

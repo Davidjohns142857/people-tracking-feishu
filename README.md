@@ -75,12 +75,17 @@ launchd/systemd，也不会把缺少 Agent 裁决能力的裸 `schedule-tick` �
 
 ## 安装或升级
 
+已有启用配置的 Agent 使用 `install_bundle.py --upgrade --doctor`、`--upgrade --dry-run`、
+`--upgrade --apply`。安装器先在生产数据库的隔离副本上校验旧配置与新版结构，再替换入口。
+重载 Skill 后直接运行 `people-tracking-feishu upgrade-resume --json`，继承原配置和现有调度任务，
+在同一任务上补充新版动作处理，立即生成一份开发者 debug 回执。该路径无需问卷或再次确认启用。
+
 从 [GitHub Releases](https://github.com/Davidjohns142857/people-tracking-feishu/releases)
 下载同一 tag 的 ZIP 与 `.sha256`。必须在同一临时下载目录中先校验外部 checksum；校验失败或
 缺少 `.sha256` 时停止，不得解压、导入或执行包内任何 Python：
 
 ```bash
-release_version="0.11.0-portable.1"
+release_version="0.11.0-portable.2"
 archive="people-tracking-feishu-${release_version}.zip"
 checksum_file="${archive}.sha256"
 
@@ -94,7 +99,7 @@ shasum -a 256 -c "${checksum_file}"
 只有 checksum 返回成功后，才解压并执行包内校验器：
 
 ```bash
-release_version="0.11.0-portable.1"
+release_version="0.11.0-portable.2"
 archive="people-tracking-feishu-${release_version}.zip"
 unzip "${archive}"
 cd "people-tracking-feishu-${release_version}"
@@ -113,7 +118,7 @@ python3 install_bundle.py --apply
 安装器不会联网安装外部依赖，不会改写现有飞书/OpenClaw/Claude 配置；同名 Skill 和 launcher
 会先备份。依赖或权限不满足时，apply 在写入前停止。
 
-升级后先预览名单与来源维护。日常运行只执行增量同步和到期扫描：
+升级后继续按现有配置增量同步及扫描到期来源。以下是日常维护命令：
 
 ```bash
 people-tracking-feishu sync --json
