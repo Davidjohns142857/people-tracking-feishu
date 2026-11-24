@@ -23,6 +23,7 @@ from urllib.parse import parse_qsl, urlparse
 from people_intel.light_cli import _public_urlopen
 
 from . import __version__
+from . import debug_status
 from .config import (
     QUESTIONNAIRE,
     ConfigError,
@@ -50,17 +51,19 @@ from .master import (
     sync_visible_master,
     visible_records,
 )
-from .reporting import markdown_http_url
+from .reporting import markdown_http_url, materialize_window_events, write_agent_review_bundle
+from .career_discovery import apply_weekly_career_search, prepare_weekly_career_search
 from .digest_editor import apply_editorial_review
 from .recovery import recovery_due
 from .sandbox import algorithm_e2e, feishu_e2e
-from .scheduler import openclaw_cron_plan
+from .scheduler import openclaw_cron_plan, refresh_existing_openclaw
 from .state import PortableState, stable_hash
 from .tracking import (
     apply_agent_review_results,
     deliver_digest,
     deliver_developer_digest,
     export_agent_review_requests,
+    has_due_source_work,
     scan_due,
 )
 ENABLE_PHRASE = "确认启用"
@@ -1551,6 +1554,9 @@ def _runtime_mode(config: dict[str, Any] | None) -> str:
     requested = str(((config or {}).get("runtime") or {}).get("mode") or "auto")
     if requested in {"openclaw", "claude_lark_cli"}:
         return requested
+    preserved = os.environ.get("PEOPLE_TRACKING_FEISHU_UPGRADE_RUNTIME")
+    if config is not None and preserved in {"openclaw", "claude_lark_cli"}:
+        return preserved
     if shutil.which("openclaw") or Path("~/.openclaw").expanduser().exists():
         return "openclaw"
     return "claude_lark_cli"
@@ -1676,6 +1682,12 @@ def command_onboarding(args: argparse.Namespace, paths: RuntimePaths) -> dict[st
             "config": _public_config(enabled),
             "scheduler": scheduler,
             "next": "run sync --apply, then scan; preview sandbox-e2e before its apply step",
+        }
+    if config and config.get("state") == "enabled":
+        return {
+            "state": "enabled", "user_configuration_required": False,
+            "config": _public_config(config) if args.show else None,
+            "next": "continue existing execution; after an upgrade run upgrade-resume",
         }
     return {
         "state": config.get("state") if config else "not_started",
@@ -2982,6 +2994,13 @@ def command_digest(args: argparse.Namespace, paths: RuntimePaths) -> dict[str, A
             delivery = state.delivery(key) if key else None
             if not delivery:
                 raise ValueError("bridge result delivery_key is unknown")
+            if delivery["output_kind"] == "control_debug":
+                if "doc_url" in payload:
+                    payload["doc_url"] = markdown_http_url(payload["doc_url"])
+                return {
+                    "bridge_result_applied": True,
+                    "delivery": debug_status.apply_receipt(state, payload),
+                }
             targets = _audience_output_config(
                 config, str(delivery.get("audience") or "public")
             )
@@ -3096,6 +3115,71 @@ def command_review_apply(args: argparse.Namespace, paths: RuntimePaths) -> dict[
         return apply_agent_review_results(state, payload)
     finally:
         state.close()
+
+
+def command_career_search_apply(
+    args: argparse.Namespace, paths: RuntimePaths
+) -> dict[str, Any]:
+    if load_config(paths).get("state") != "enabled":
+        raise ValueError("career search requires enabled tracking")
+    payload = _json_file(args.input)
+    state = PortableState(paths.database)
+    try:
+        return apply_weekly_career_search(state, payload)
+    finally:
+        state.close()
+
+
+def command_validation_profile(
+    args: argparse.Namespace, paths: RuntimePaths | None
+) -> dict[str, Any]:
+    """Operate an explicitly isolated control page without opening live state."""
+    del paths
+    from .validation_profile import (
+        advance_profile,
+        bind_origin,
+        evaluate_profile,
+        export_registration,
+        import_remote_observations,
+        init_profile,
+        observe_profile,
+        record_publication_receipt,
+        record_registration_receipt,
+        run_local_http_smoke,
+        tick_profile,
+    )
+
+    action = args.validation_action
+    if action == "init":
+        return init_profile(
+            args.root,
+            subject_name=args.subject_name,
+            public_url=args.public_url,
+            interval_seconds=args.interval_seconds,
+            detection_sla_seconds=args.detection_sla_seconds,
+            confirmation_sla_seconds=args.confirmation_sla_seconds,
+        )
+    if action == "advance":
+        return advance_profile(args.root, scenario=args.scenario)
+    if action == "tick":
+        return tick_profile(args.root, evidence_source=args.evidence_source)
+    if action == "check":
+        return evaluate_profile(args.root, evidence_source=args.evidence_source)
+    if action == "registration":
+        return export_registration(args.root)
+    if action == "bind-origin":
+        return bind_origin(args.root, args.public_url)
+    if action == "observe":
+        return observe_profile(args.root)
+    if action == "record-receipt":
+        return record_registration_receipt(args.root, _json_file(args.input))
+    if action == "record-publication":
+        return record_publication_receipt(args.root, _json_file(args.input))
+    if action == "import-observations":
+        return import_remote_observations(args.root, _json_file(args.input))
+    if action == "smoke":
+        return run_local_http_smoke(args.root, subject_name=args.subject_name)
+    raise ValueError("unknown controlled-profile action")
 
 
 def command_sandbox(args: argparse.Namespace, paths: RuntimePaths) -> dict[str, Any]:
@@ -3577,8 +3661,94 @@ def _sync_or_queue_visible_master(
     }
 
 
+def command_debug_status(args: argparse.Namespace, paths: RuntimePaths) -> dict[str, Any]:
+    config = load_config(paths)
+    if config.get("state") != "enabled":
+        raise ValueError("debug status requires an enabled runtime")
+    if bool(args.target_kind) != bool(args.target_id) or (args.target_id and not args.enable):
+        raise ValueError("a debug target requires --enable, --target-kind and --target-id")
+    state = PortableState(paths.database)
+    try:
+        if args.control_source_id:
+            return debug_status.export_control_observations(state, config, args.control_source_id)
+        now = datetime.now(timezone.utc)
+        if args.enable:
+            settings = state.get_meta(debug_status.SETTINGS, {})
+            if args.target_id:
+                if not args.target_id.startswith({"user": "ou_", "chat": "oc_"}[args.target_kind]):
+                    raise ValueError("debug target must be the corresponding Feishu open ID")
+                settings["target"] = {
+                    "enabled": True, "target_kind": args.target_kind, "target_id": args.target_id,
+                }
+            if debug_status.recipient(config, settings):
+                state.set_meta(debug_status.SETTINGS, {**settings, "enabled": True})
+                delivery = debug_status.prepare(state, config, now=now)
+            else:
+                delivery = {"status": "developer_target_missing", "actions": []}
+        else:
+            delivery = None
+        report = debug_status.status(state, now=now, timezone_name=config["schedule"]["timezone"])
+        return {
+            "report": report, "markdown": debug_status.markdown(report),
+            "delivery": delivery, "actions": (delivery or {}).get("actions", []),
+        }
+    finally:
+        state.close()
+
+
+def command_upgrade_resume(args: argparse.Namespace, paths: RuntimePaths) -> dict[str, Any]:
+    config = load_config(paths)
+    if config.get("state") != "enabled":
+        return {"status": "existing_configuration_inactive", "user_configuration_required": False,
+                "actions": []}
+    state = PortableState(paths.database)
+    try:
+        now = datetime.now(timezone.utc)
+        settings = state.get_meta(debug_status.SETTINGS, {})
+        state.set_meta(debug_status.SETTINGS, {**settings, "enabled": True, "use_existing_outputs": True})
+        pending = debug_status.prepare(state, config, now=now) or {}
+        report = debug_status.status(state, now=now, timezone_name=config["schedule"]["timezone"])
+    finally:
+        state.close()
+    mode = _runtime_mode(config)
+    job = (
+        refresh_existing_openclaw(
+            Path(args.launcher or "~/.local/bin/people-tracking-feishu").expanduser(),
+            config_root=paths.config_root, state_root=paths.state_root,
+        )
+        if mode == "openclaw" else {"status": "existing_interactive_mode"}
+    )
+    return {
+        "status": "existing_configuration_resumed", "runtime_mode": mode,
+        "user_configuration_required": False, "scheduler": job, "control_debug": pending,
+        "existing_schedule_verified": job.get("status") in {"current", "refreshed"}
+        and job.get("enabled") is True,
+        "markdown": debug_status.markdown(report), "actions": pending.get("actions", []),
+    }
+
+
 def command_schedule_tick(args: argparse.Namespace, paths: RuntimePaths) -> dict[str, Any]:
     config = load_config(paths)
+    result = _run_schedule_tick(args, paths, config)
+    if result.get("skipped") or _runtime_mode(config) != "openclaw":
+        return result
+    try:
+        state = PortableState(paths.database)
+        try:
+            debug = debug_status.prepare(state, config, now=datetime.now(timezone.utc), tick=result)
+        finally:
+            state.close()
+    except Exception as exc:
+        # Debug delivery must remain independent of the real reporting gates.
+        result["control_debug"] = {"status": "error", "error_type": type(exc).__name__}
+    else:
+        if debug:
+            result["control_debug"] = {k: v for k, v in debug.items() if k != "actions"}
+            result["actions"].extend(debug["actions"])
+    return result
+
+
+def _run_schedule_tick(args: argparse.Namespace, paths: RuntimePaths, config: dict) -> dict[str, Any]:
     if config.get("state") != "enabled":
         return {"skipped": True, "reason": "configuration is not enabled"}
     if _runtime_mode(config) != "openclaw":
@@ -3624,7 +3794,14 @@ def command_schedule_tick(args: argparse.Namespace, paths: RuntimePaths) -> dict
         # A recovery queue wakes the normal due-only pipeline during the week,
         # independently of the user's regular full scan cadence. Roster/master
         # gates still run before any source access.
-        scan_is_due = scan_is_due or recovery_due(schedule_state, now=now)
+        # An empty regular scan must not hide a source that becomes due seconds
+        # later. Only fetch-eligible established sources can wake another tick;
+        # host blocks, budgets and manual-attention entries remain deferred.
+        scan_is_due = (
+            scan_is_due
+            or has_due_source_work(schedule_state, config, now=now)
+            or recovery_due(schedule_state, now=now)
+        )
         pending_source_bridge = schedule_state.get_meta("bridge_request:source_sync")
         pending_master_bridge = schedule_state.get_meta("bridge_request:master_sync")
         roster_checkpoint = schedule_state.get_meta("scheduler_roster_checkpoint")
@@ -3915,11 +4092,76 @@ def command_schedule_tick(args: argparse.Namespace, paths: RuntimePaths) -> dict
 
         reviews_waiting = False
         delivery_waiting = False
+        search_waiting = False
+        career_search_progress = None
+        if not (validation_failed or roster_bridge_waiting or master_bridge_waiting):
+            through = datetime.now(timezone.utc)
+            # A scan can complete after the tick's initial clock reading.
+            materialize_window_events(
+                state,
+                window_start=(now - timedelta(days=15)).isoformat(),
+                window_end=through.isoformat(),
+                career_only=True,
+            )
+            if state.db.execute(
+                """SELECT 1 FROM agent_review_requests a
+                   JOIN event_ledger e ON e.event_id=a.event_id
+                   WHERE a.status='pending' AND (
+                       e.event_id LIKE 'evt_career_%'
+                       OR json_extract(e.payload_json,'$.source_kind')='career_search')
+                   LIMIT 1"""
+            ).fetchone():
+                review_path = paths.reports / "scheduled-career-agent-review.json"
+                review_bundle = write_agent_review_bundle(
+                    state, review_path, batch_size=int(
+                        (config.get("agent_review") or {}).get("batch_size", 100)
+                    ),
+                )
+                if review_bundle["requests"]:
+                    reviews_waiting = True
+                    actions.append({
+                        "operation": "execution_agent_review",
+                        "kind": "career",
+                        "payload_file": str(review_path),
+                        "requests": len(review_bundle["requests"]),
+                        "decision_authority": "skill_host_agent",
+                        "next": "Apply review-apply and resume schedule-tick",
+                    })
+            if not reviews_waiting:
+                schedule = config["schedule"]
+                discovery = prepare_weekly_career_search(
+                    state, at=through, timezone_name=schedule["timezone"],
+                    window_key=_career_search_period(now, schedule),
+                )
+                career_search_progress = {
+                    key: discovery[key] for key in (
+                        "window_key", "status", "eligible_count", "completed_count",
+                        "pending_count", "next_retry_at",
+                    )
+                }
+                request = discovery.get("request")
+                if request:
+                    search_waiting = True
+                    search_path = paths.reports / f"{request['request_id']}-career-search.json"
+                    secure_write_json(search_path, {**request, "instructions": discovery["instructions"]})
+                    actions.append({
+                        "operation": "execution_agent_career_search",
+                        "adapter": "execution_agent_career_search",
+                        "payload_file": str(search_path),
+                        "eligible_count": discovery["eligible_count"],
+                        "completed_count": discovery["completed_count"],
+                        "next": "Search the assigned people, then run career-search-apply --input FILE",
+                    })
         for kind in ("daily", "weekly"):
             if not _digest_due_now(kind, now, config["schedule"]):
                 continue
             prepared_period = _scheduler_period(kind, now, config["schedule"]["timezone"])
             if state.get_meta(f"scheduler_digest_{kind}") == prepared_period:
+                continue
+            if reviews_waiting and any(
+                action.get("kind") == "career" for action in actions
+            ):
+                # The existing fact-review lease is already exposed above.
                 continue
             if validation_failed:
                 # Validation is a publication gate, not a diagnostics gate.
@@ -4091,6 +4333,7 @@ def command_schedule_tick(args: argparse.Namespace, paths: RuntimePaths) -> dict
                 or master_bridge_waiting
                 or reviews_waiting
                 or delivery_waiting
+                or search_waiting
             )
         ):
             state.set_meta(
@@ -4119,6 +4362,8 @@ def command_schedule_tick(args: argparse.Namespace, paths: RuntimePaths) -> dict
             "public_delivery_blocked": public_delivery_blocked,
             "reviews_waiting": reviews_waiting,
             "delivery_waiting": delivery_waiting,
+            "career_search_waiting": search_waiting,
+            "career_search_progress": career_search_progress,
             "actions": actions,
             "next": (
                 "complete every roster read bridge and rerun schedule-tick"
@@ -4131,6 +4376,8 @@ def command_schedule_tick(args: argparse.Namespace, paths: RuntimePaths) -> dict
                 if reviews_waiting
                 else "complete the pending delivery bridge and resume this tick"
                 if delivery_waiting
+                else "apply the career search results and resume this tick"
+                if search_waiting
                 else None
             ),
         }
@@ -4145,6 +4392,19 @@ def _scheduler_period(kind: str, now: datetime, timezone_name: str) -> str:
     if kind == "daily":
         return local.date().isoformat()
     start = local.date() - timedelta(days=local.weekday())
+    return start.isoformat()
+
+
+def _career_search_period(now: datetime, schedule: dict[str, Any]) -> str:
+    from zoneinfo import ZoneInfo
+
+    local_day = now.astimezone(ZoneInfo(schedule["timezone"])).date()
+    delivery_day = str(schedule.get("weekly_digest") or "MON 08:30").split()[0].upper()
+    weekdays = ("MON", "TUE", "WED", "THU", "FRI", "SAT", "SUN")
+    if delivery_day not in weekdays:
+        raise ValueError("weekly_digest weekday is invalid")
+    search_weekday = (weekdays.index(delivery_day) - 2) % 7
+    start = local_day - timedelta(days=(local_day.weekday() - search_weekday) % 7)
     return start.isoformat()
 
 
@@ -4272,7 +4532,53 @@ def parser() -> argparse.ArgumentParser:
     review_apply = commands.add_parser("review-apply")
     review_apply.add_argument("--input", type=Path, required=True)
 
+    career_search = commands.add_parser("career-search-apply")
+    career_search.add_argument("--input", type=Path, required=True)
+
     commands.add_parser("doctor")
+    resume = commands.add_parser("upgrade-resume", help="resume the existing configured runtime after upgrade")
+    resume.add_argument("--launcher", help=argparse.SUPPRESS)
+
+    debug = commands.add_parser("debug-status", help="inspect production control-page and scan evidence")
+    debug_mode = debug.add_mutually_exclusive_group()
+    debug_mode.add_argument("--enable", action="store_true", help="queue the first report and enable recurring reports")
+    debug_mode.add_argument("--control-source-id", help="export compact scan evidence for one control homepage")
+    debug.add_argument("--target-kind", choices=("chat", "user"))
+    debug.add_argument("--target-id")
+
+    validation = commands.add_parser(
+        "validation-profile", help="controlled Homepage and isolated detection checks"
+    )
+    validation_actions = validation.add_subparsers(
+        dest="validation_action", required=True
+    )
+    for action in (
+        "init", "advance", "tick", "check", "registration", "smoke",
+        "observe", "bind-origin", "record-receipt", "record-publication", "import-observations",
+    ):
+        action_parser = validation_actions.add_parser(action)
+        action_parser.add_argument("--root", type=Path, required=True)
+        if action in {"init", "smoke"}:
+            action_parser.add_argument("--subject-name", required=True)
+        if action == "init":
+            action_parser.add_argument("--public-url")
+            action_parser.add_argument("--interval-seconds", type=int, default=86400)
+            action_parser.add_argument("--detection-sla-seconds", type=int, default=3600)
+            action_parser.add_argument("--confirmation-sla-seconds", type=int, default=7200)
+        if action == "bind-origin":
+            action_parser.add_argument("--public-url", required=True)
+        if action == "advance":
+            action_parser.add_argument(
+                "--scenario",
+                choices=("current", "historical_backfill", "undated", "no_change", "startup", "job_change"),
+                default="current",
+            )
+        if action in {"check", "tick"}:
+            action_parser.add_argument(
+                "--evidence-source", choices=("local", "remote"), required=True
+            )
+        if action in {"record-receipt", "record-publication", "import-observations"}:
+            action_parser.add_argument("--input", type=Path, required=True)
 
     sandbox = commands.add_parser("sandbox-e2e")
     sandbox.add_argument("--apply", action="store_true")
@@ -4290,7 +4596,9 @@ def main(argv: list[str] | None = None) -> int:
         values = ["--json", *(value for value in values if value != "--json")]
     args = parser().parse_args(values)
     try:
-        paths = _runtime_paths(args)
+        # Validation has its own explicit directory and must not create, migrate,
+        # or accidentally open the user's production runtime.
+        paths = None if args.command == "validation-profile" else _runtime_paths(args)
         handlers = {
             "onboarding": command_onboarding,
             "source-probe": command_source_probe,
@@ -4302,8 +4610,12 @@ def main(argv: list[str] | None = None) -> int:
             "digest-review-apply": command_digest_review_apply,
             "review-export": command_review_export,
             "review-apply": command_review_apply,
+            "career-search-apply": command_career_search_apply,
             "doctor": command_doctor,
+            "upgrade-resume": command_upgrade_resume,
+            "debug-status": command_debug_status,
             "sandbox-e2e": command_sandbox,
+            "validation-profile": command_validation_profile,
             "schedule-tick": command_schedule_tick,
         }
         data = handlers[args.command](args, paths)
@@ -4318,9 +4630,20 @@ def main(argv: list[str] | None = None) -> int:
             args.command == "schedule-tick"
             and bool(data.get("validation_failed") or data.get("roster_sync_failed"))
         )
-        if validation_failed or scan_partial:
-            error_type = "ScanPartialFailure" if scan_partial else "ScanValidationFailed"
+        profile_result = data.get("evaluation", data) if isinstance(data, dict) else {}
+        profile_failed = (
+            args.command == "validation-profile"
+            and isinstance(profile_result, dict)
+            and bool(profile_result.get("failed", 0))
+        )
+        if validation_failed or scan_partial or profile_failed:
+            error_type = (
+                "ControlledProfileValidationFailed" if profile_failed
+                else "ScanPartialFailure" if scan_partial else "ScanValidationFailed"
+            )
             error_message = (
+                "controlled Homepage check found failures; inspect per-event evidence"
+                if profile_failed else
                 "scan completed partially; source errors were preserved for retry"
                 if scan_partial
                 else "scan evidence was preserved, but strict validation failed"
@@ -4337,6 +4660,21 @@ def main(argv: list[str] | None = None) -> int:
             }
             print(json.dumps(payload, ensure_ascii=False, indent=2))
             return 3
+        if (
+            args.command == "validation-profile"
+            and args.validation_action == "check"
+            and profile_result.get("status") != "passed"
+        ):
+            payload = {
+                "ok": False, "command": args.command, "version": __version__,
+                "data": data,
+                "error": {
+                    "type": "ControlledProfileValidationIncomplete",
+                    "message": "control-page evidence is incomplete; validation has not passed",
+                },
+            }
+            print(json.dumps(payload, ensure_ascii=False, indent=2))
+            return 4
         payload = {"ok": True, "command": args.command, "version": __version__, "data": data}
         print(json.dumps(payload, ensure_ascii=False, indent=2))
         return 0

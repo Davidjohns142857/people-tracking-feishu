@@ -1965,7 +1965,10 @@ class PortableState:
         rows = self.db.execute(
             """SELECT e.* FROM event_ledger e
                WHERE e.audience='public' AND e.disposition='publish'
+                 AND COALESCE(json_extract(e.payload_json,'$.debug_only'),0)=0
                  AND julianday(e.occurred_at)<=julianday(?)
+                 AND (? IS NOT 'daily' OR
+                      COALESCE(json_extract(e.payload_json,'$.source_kind'),'')<>'career_search')
                  AND NOT EXISTS (
                    SELECT 1 FROM report_items i
                    JOIN report_ledger r ON r.report_key=i.report_key
@@ -1973,7 +1976,7 @@ class PortableState:
                      AND (? IS NULL OR r.output_kind=?)
                  )
                ORDER BY e.occurred_at,e.event_id""",
-            (through, output_kind, output_kind),
+            (through, output_kind, output_kind, output_kind),
         ).fetchall()
         result: list[dict[str, Any]] = []
         for row in rows:

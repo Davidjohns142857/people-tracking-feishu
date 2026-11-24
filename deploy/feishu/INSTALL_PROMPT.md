@@ -1,17 +1,31 @@
-请把我附带的 `people-tracking-feishu` 压缩包安装到你当前这个已经能正常运行飞书的 Claude/OpenClaw Agent 后台，并在安装后接管首次人员入库和持续跟踪初始化。
+请把我附带的 `people-tracking-feishu` 压缩包装到当前飞书 Claude/OpenClaw Agent。已有启用配置时，用原地升级流程继续运行，继承所有现有设置与历史记录。
 
 先不要解压。确认附件中同时存在同一 release、同一 basename 的 ZIP 和 `ZIP.sha256`；缺少任一文件就停止。进入只含这两个下载资产的临时目录，Linux 用 `sha256sum -c '<ZIP文件名>.sha256'`，macOS 用 `shasum -a 256 -c '<ZIP文件名>.sha256'`。checksum 未明确返回成功时，禁止解压、导入或执行包内任何 Python。不要用包内脚本替代这一步外部 checksum 校验。
 
-checksum 成功后才解压，进入唯一的 `people-tracking-feishu-<version>` 目录，依次运行 `python3 verify_release.py`、`python3 install_bundle.py --doctor` 和 `python3 install_bundle.py --dry-run`。如果三步均成功且没有依赖、权限、版本或路径冲突，不用停下来等我再次批准，直接运行 `python3 install_bundle.py --apply`。如果任一步失败，停止写入，只报告失败项和包内给出的官方固定版本修复命令；不要自行联网安装，不要改写现有飞书凭证、Claude/OpenClaw 配置、其他 Skills、cron 或服务。不要执行 `lark-cli config init --new`。不要让我在聊天中发送 API key、App Secret、Cookie 或密码。
+checksum 成功后才解压，进入唯一的 `people-tracking-feishu-<version>` 目录，运行 `python3 verify_release.py`。
+若是现有系统升级，使用 `python3 install_bundle.py --upgrade --doctor` 和 `--upgrade --dry-run`，随后是
+`--upgrade --apply`；首次安装才省略 `--upgrade`。校验成功并满足依赖时直接 apply。任何真实依赖或权限错误
+只报告具体技术状态；现有凭证、其他 Skills 和服务保留。不要执行 `lark-cli config init --new`，不要要求提供凭证。
 
 安全边界必须如实报告：ZIP 与 `.sha256` 来自同一个 GitHub Release，这能校验传输/存储完整性，不能独立认证发布者。当前 release 模板不生成 Sigstore/GitHub Artifact Attestation；信任根是 GitHub HTTPS、仓库发布权限和维护者不改写 tag/Release 的纪律。若用户要求独立发布者认证，在维护者通过另一个可信渠道给出 digest 或签名证明前停止安装，不得把同源 checksum 宣称为数字签名或外部证明。
 
-安装成功后重载 Skill，运行 `people-tracking-feishu onboarding --json`，把返回的完整问卷作为一条飞书消息发给我。问卷只问一次，收集人员来源、字段映射、缺主页时自动检索或人工补全、可见总库、互相隔离的用户/开发者输出、频率、时区及可选搜索 API。变化裁定由当前执行 Agent 使用自身 token 完成；不要配置或调用 DeepSeek。
+## 当前系统已配置时
 
-若这是升级安装，先保留安装器创建的旧 Skill/launcher 备份和现有 SQLite。运行
-`people-tracking-feishu source-routes --json` 预览已登记的 canonical、公开 fallback 与软退役动作；
-只有预览无 exact-match/安全错误时才运行 `source-routes --apply --json`。不得删除旧来源、历史观察、
-候选或确认基线。
+doctor、dry-run 和 apply 都使用 `--upgrade`，以显式核对当前正在用的旧配置与数据库。
+若旧任务使用自定义目录，从原 launcher/调度参数读取实际 `--config-root`、`--state-root` 并原样传递。
+`plan.ready_to_apply=true` 后直接 apply，不询问新设定或再次确认。重载 Skill 后立即运行
+`result.resume_argv`（即已绑定原路径的 `people-tracking-feishu upgrade-resume --json`），发送或保存它返回的开发者 debug 回执。
+从现有开发者收件人、开发者文档或本机开发者报告中沿用实际已配置的路径。若首报仅保存本地，直接把
+返回的 `markdown` 回复在当前升级私聊。通过真实 `message_id` 或 `doc_url` 回填投递结果。
+保留旧 Base 映射、目标、时区、频率、凭证、名单、基线、审核与报告游标。对 OpenClaw 只在原 job ID
+更新动作处理说明并回读，既不重建任务也不更改原频率。无需 onboarding、bootstrap、
+source-routes apply、全量重新入库、强制复扫或新登录。临时来源/桥接/调度回读问题只报告实际技术状态，
+保留新版继续查明原因，不因新功能等待而主动回退。升级流程在此结束。
+
+## 仅首次配置
+
+只有安装返回 `installation_phase=fresh` 时才运行 `people-tracking-feishu onboarding --json`，
+把一次性问卷发给我。已有草稿或暂停配置按原状态保留，不当成首次安装。
 
 收到我的回答后，把它规范化为 `people-tracking-config-v1`，运行只读 `source-probe`。OpenClaw 模式若返回 `agent_tool_bridge` action，立即使用当前已有的官方飞书工具读取相应 Base、文档或 Wiki，把真实 schema、record_id、分页完整性、记录数和读取结果回填；不要让我手工搬运数据。然后向我发送一条启用预览，明确列出来源数、读取到的人数、字段映射、缺主页人数、总库模式、两类输出目标、调度和搜索 API 预算，并只询问我是否回复“确认启用”。
 
@@ -43,7 +57,7 @@ OpenClaw 首次完成后，每个隔离 Agent tick 都先读取名单表并以�
 才允许把缺失行标为 removed；删除仅 tombstone，不删内部历史；恢复同一 record_id 时复用历史。
 仅新增、URL/身份锚点更新或恢复记录进入后续工作集，普通名单编辑不得触发全量网页扫描。
 
-升级或来源修复完成后，用以下命令做一次严格 Homepage 复扫：
+仅在另行委托严格 Homepage 验收或定向来源修复时，使用以下命令：
 
 `people-tracking-feishu scan --force-all --force-full-fetch --source-kind homepage --homepage-retries 1 --homepage-backoff-seconds 1.0 --max-error-rate 0.10 --json`
 

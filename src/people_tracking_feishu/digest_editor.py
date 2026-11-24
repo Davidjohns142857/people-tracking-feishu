@@ -6,13 +6,16 @@ import hashlib
 import json
 import re
 from typing import Any
+from urllib.parse import urlsplit
 
 from .config import RuntimePaths, secure_write_json
 from .reporting import (
     _contains_instruction_like_text,
     _markdown_plain_text,
     _validate_public_text,
+    career_search_date_label,
     markdown_http_url,
+    validate_career_summary,
 )
 from .state import PortableState
 
@@ -31,12 +34,23 @@ def _hash(value: Any) -> str:
 
 def is_publication(event: dict[str, Any]) -> bool:
     p = event["payload"]
+    if _is_career(event):
+        return False
     return str(
         (p.get("raw_item") or {}).get("category", "")
     ).casefold() == "publication" or str(
         p.get("change_type", "")
     ).casefold().startswith(
         "publication"
+    )
+
+
+def _is_career(event: dict[str, Any]) -> bool:
+    payload = event["payload"]
+    change_type = str(payload.get("change_type", "")).casefold()
+    return payload.get("source_kind") == "career_search" or change_type.startswith(
+        ("position_", "affiliation_", "career_", "founded_company",
+         "joined_company", "role_change", "left_company")
     )
 
 
@@ -54,6 +68,14 @@ def editorial_request(prepared: dict[str, Any]) -> dict[str, Any]:
         }
         for e in prepared["events"]
     ]
+    for item, event in zip(evidence, prepared["events"]):
+        payload = event["payload"]
+        if payload.get("source_kind") == "career_search":
+            fact = payload.get("career_search") or {}
+            item["career_search"] = {
+                key: fact.get(key) for key in ("event_date", "date_precision", "date_semantics")
+            }
+            item["observed_at"] = payload.get("observed_at")
     payload = {
         "schema_version": SCHEMA,
         "delivery_key": prepared["delivery_key"],
@@ -156,6 +178,8 @@ def apply_editorial_review(
                     )
         award = item["award_note"]
         event = expected[eid]
+        if "career_search" in event:
+            validate_career_summary(item["summary"])
         if award and (
             not event["publication"]
             or not _AWARD.search(award)
@@ -181,8 +205,13 @@ def render_tiered_message(
     footer = f"[完整人员跟踪报告]({markdown_http_url(doc_url)})"
     if len(footer) > MAX_MESSAGE_CHARS - 650:
         raise ValueError("full-document URL is too long for a compact weekly message")
-    ranked = sorted(items, key=lambda i: (-i["importance"], i["event_id"]))
     by_id = {e["event_id"]: e for e in events}
+    ranked = sorted(
+        items,
+        key=lambda i: (
+            not _is_career(by_id[i["event_id"]]), -i["importance"], i["event_id"]
+        ),
+    )
     nonpapers = [i for i in ranked if not is_publication(by_id[i["event_id"]])]
     papers = [i for i in ranked if is_publication(by_id[i["event_id"]])]
     lines = ["**本周人员动态**"]
@@ -195,6 +224,12 @@ def render_tiered_message(
             by_id[item["event_id"]]["payload"]["person_name"], limit=person_limit
         )
         text = _markdown_plain_text(item["summary"], limit=limit)
+        payload = by_id[item["event_id"]]["payload"]
+        if payload.get("source_kind") == "career_search":
+            host = urlsplit(payload["source_url"]).hostname or "公开来源"
+            label = _markdown_plain_text(host.removeprefix("www."), limit=22)
+            date = career_search_date_label(payload.get("career_search") or {})
+            text += f"（{_markdown_plain_text(date, limit=30)} · {label}）"
         return f"{person}—{text}"
 
     def section(title: str, rows: list[str]) -> None:

@@ -78,6 +78,11 @@ Agent 最终批准才能进入用户报告。纯 UI 词、同文案换链接、�
 周中每批扫描的 DNS 缓存刷新、恢复重试、持久退避及需要人工处理状态记录在
 `network_recovery` 开发者指标中；诊断与修复不改变已批准人员事实。
 
+固定来源以外的每周创业与任职检索遵守[职业动态发现](career-discovery.md)：消费
+`execution_agent_career_search.payload_file`，真实检索后通过`career-search-apply`完整回填
+精确批次。已核实发现仍建立标准待审事件，既有公开审核、跨周事实去重和用户/开发者分流
+继续适用。检索失败或尚未完成不能伪装成无变化，也不阻断其他已批准事实的周报。
+
 ## Scholar 429
 
 Scholar 使用持久的 host circuit 和请求预算。收到 429 或有效 `Retry-After` 后立即停止该 host

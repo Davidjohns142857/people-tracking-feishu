@@ -100,6 +100,10 @@ def stage_release(staging: Path) -> None:
         _copy_file(ROOT / name, staging / "full-source" / name)
     for relative in ("db/schema.sql", "ontology/people-intel-v1.json"):
         _copy_file(ROOT / relative, staging / "full-source" / relative)
+    # Standalone, read-only diagnostics must be available on the target host
+    # without importing/migrating its production runtime or installing deps.
+    for name in ("export_coverage_audit.py", "export_discovery_audit.py"):
+        _copy_file(ROOT / "scripts" / name, staging / "scripts" / name)
     wheel_root = ROOT / "vendor" / "wheels"
     wheels = sorted(wheel_root.glob("pypinyin-0.55.0-*.whl"))
     if len(wheels) != 1:
@@ -213,6 +217,8 @@ def manifest(staging: Path, files: dict[str, str], epoch: int) -> dict[str, Any]
             "dry_run": "python3 install_bundle.py --dry-run",
             "apply": "python3 install_bundle.py --apply",
             "runtime": "people-tracking-feishu",
+            "coverage_audit": "python3 scripts/export_coverage_audit.py --database DATABASE --since SINCE --until UNTIL --output NEW_JSON",
+            "discovery_audit": "python3 scripts/export_discovery_audit.py --database DATABASE --since SINCE --until UNTIL --output NEW_JSON",
             "source_routes_preview": "people-tracking-feishu source-routes --json",
             "strict_homepage_scan": (
                 "people-tracking-feishu scan --force-all --force-full-fetch "
