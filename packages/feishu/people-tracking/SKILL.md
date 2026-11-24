@@ -238,6 +238,13 @@ python3 scripts/skill_entry.py schedule-tick --json
 
 ## 持续控制主页验证
 
+部署负责人要求启用线上 debug 回执时，升级后立即执行 `debug-status --enable --json`，处理返回的
+developer 消息动作，并用 `digest --bridge-results FILE --json` 回填真实收件回执。无需等下一次扫描。
+已有固定 developer 收件人时直接复用；否则在当前私聊中把返回的 markdown 原样回复，常规自动投递
+需要负责人指定独立开发者收件人。常规回执使用现有调度，每周一 08:00、周四 20:00（部署时区）。
+即使 `schedule-tick` 返回业务阻塞，也要独立处理 `control_debug` 的 developer 消息动作。
+详情见[控制主页和 debug 回执契约](references/controlled-profile-validation.md)。
+
 需要核验“页面更新 → 首次发现 → 确认”延迟时，使用
 [控制主页验证契约](references/controlled-profile-validation.md)。`validation-profile` 创建显式
 `[TEST]` 身份、可托管主页、注入账本和隔离验证库，不打开正式 runtime。只使用用户明确给出的

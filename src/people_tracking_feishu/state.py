@@ -1965,6 +1965,7 @@ class PortableState:
         rows = self.db.execute(
             """SELECT e.* FROM event_ledger e
                WHERE e.audience='public' AND e.disposition='publish'
+                 AND COALESCE(json_extract(e.payload_json,'$.debug_only'),0)=0
                  AND julianday(e.occurred_at)<=julianday(?)
                  AND (? IS NOT 'daily' OR
                       COALESCE(json_extract(e.payload_json,'$.source_kind'),'')<>'career_search')

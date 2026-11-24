@@ -23,6 +23,7 @@ from urllib.parse import parse_qsl, urlparse
 from people_intel.light_cli import _public_urlopen
 
 from . import __version__
+from . import debug_status
 from .config import (
     QUESTIONNAIRE,
     ConfigError,
@@ -2984,6 +2985,11 @@ def command_digest(args: argparse.Namespace, paths: RuntimePaths) -> dict[str, A
             delivery = state.delivery(key) if key else None
             if not delivery:
                 raise ValueError("bridge result delivery_key is unknown")
+            if delivery["output_kind"] == "control_debug":
+                return {
+                    "bridge_result_applied": True,
+                    "delivery": debug_status.apply_receipt(state, payload),
+                }
             targets = _audience_output_config(
                 config, str(delivery.get("audience") or "public")
             )
@@ -3120,6 +3126,7 @@ def command_validation_profile(
     del paths
     from .validation_profile import (
         advance_profile,
+        bind_origin,
         evaluate_profile,
         export_registration,
         import_remote_observations,
@@ -3149,6 +3156,8 @@ def command_validation_profile(
         return evaluate_profile(args.root, evidence_source=args.evidence_source)
     if action == "registration":
         return export_registration(args.root)
+    if action == "bind-origin":
+        return bind_origin(args.root, args.public_url)
     if action == "observe":
         return observe_profile(args.root)
     if action == "record-receipt":
@@ -3641,8 +3650,63 @@ def _sync_or_queue_visible_master(
     }
 
 
+def command_debug_status(args: argparse.Namespace, paths: RuntimePaths) -> dict[str, Any]:
+    config = load_config(paths)
+    if config.get("state") != "enabled":
+        raise ValueError("debug status requires an enabled runtime")
+    if bool(args.target_kind) != bool(args.target_id) or (args.target_id and not args.enable):
+        raise ValueError("a debug target requires --enable, --target-kind and --target-id")
+    state = PortableState(paths.database)
+    try:
+        if args.control_source_id:
+            return debug_status.export_control_observations(state, config, args.control_source_id)
+        now = datetime.now(timezone.utc)
+        if args.enable:
+            settings = state.get_meta(debug_status.SETTINGS, {})
+            if args.target_id:
+                if not args.target_id.startswith({"user": "ou_", "chat": "oc_"}[args.target_kind]):
+                    raise ValueError("debug target must be the corresponding Feishu open ID")
+                settings["target"] = {
+                    "enabled": True, "target_kind": args.target_kind, "target_id": args.target_id,
+                }
+            if debug_status.recipient(config, settings):
+                state.set_meta(debug_status.SETTINGS, {**settings, "enabled": True})
+                delivery = debug_status.prepare(state, config, now=now)
+            else:
+                delivery = {"status": "developer_target_missing", "actions": []}
+        else:
+            delivery = None
+        report = debug_status.status(state, now=now, timezone_name=config["schedule"]["timezone"])
+        return {
+            "report": report, "markdown": debug_status.markdown(report),
+            "delivery": delivery, "actions": (delivery or {}).get("actions", []),
+        }
+    finally:
+        state.close()
+
+
 def command_schedule_tick(args: argparse.Namespace, paths: RuntimePaths) -> dict[str, Any]:
     config = load_config(paths)
+    result = _run_schedule_tick(args, paths, config)
+    if result.get("skipped") or _runtime_mode(config) != "openclaw":
+        return result
+    try:
+        state = PortableState(paths.database)
+        try:
+            debug = debug_status.prepare(state, config, now=datetime.now(timezone.utc), tick=result)
+        finally:
+            state.close()
+    except Exception as exc:
+        # Debug delivery must remain independent of the real reporting gates.
+        result["control_debug"] = {"status": "error", "error_type": type(exc).__name__}
+    else:
+        if debug:
+            result["control_debug"] = {k: v for k, v in debug.items() if k != "actions"}
+            result["actions"].extend(debug["actions"])
+    return result
+
+
+def _run_schedule_tick(args: argparse.Namespace, paths: RuntimePaths, config: dict) -> dict[str, Any]:
     if config.get("state") != "enabled":
         return {"skipped": True, "reason": "configuration is not enabled"}
     if _runtime_mode(config) != "openclaw":
@@ -4431,6 +4495,13 @@ def parser() -> argparse.ArgumentParser:
 
     commands.add_parser("doctor")
 
+    debug = commands.add_parser("debug-status", help="inspect production control-page and scan evidence")
+    debug_mode = debug.add_mutually_exclusive_group()
+    debug_mode.add_argument("--enable", action="store_true", help="queue the first report and enable recurring reports")
+    debug_mode.add_argument("--control-source-id", help="export compact scan evidence for one control homepage")
+    debug.add_argument("--target-kind", choices=("chat", "user"))
+    debug.add_argument("--target-id")
+
     validation = commands.add_parser(
         "validation-profile", help="controlled Homepage and isolated detection checks"
     )
@@ -4439,7 +4510,7 @@ def parser() -> argparse.ArgumentParser:
     )
     for action in (
         "init", "advance", "tick", "check", "registration", "smoke",
-        "observe", "record-receipt", "record-publication", "import-observations",
+        "observe", "bind-origin", "record-receipt", "record-publication", "import-observations",
     ):
         action_parser = validation_actions.add_parser(action)
         action_parser.add_argument("--root", type=Path, required=True)
@@ -4450,10 +4521,12 @@ def parser() -> argparse.ArgumentParser:
             action_parser.add_argument("--interval-seconds", type=int, default=86400)
             action_parser.add_argument("--detection-sla-seconds", type=int, default=3600)
             action_parser.add_argument("--confirmation-sla-seconds", type=int, default=7200)
+        if action == "bind-origin":
+            action_parser.add_argument("--public-url", required=True)
         if action == "advance":
             action_parser.add_argument(
                 "--scenario",
-                choices=("current", "historical_backfill", "undated", "no_change"),
+                choices=("current", "historical_backfill", "undated", "no_change", "startup", "job_change"),
                 default="current",
             )
         if action in {"check", "tick"}:
@@ -4495,6 +4568,7 @@ def main(argv: list[str] | None = None) -> int:
             "review-apply": command_review_apply,
             "career-search-apply": command_career_search_apply,
             "doctor": command_doctor,
+            "debug-status": command_debug_status,
             "sandbox-e2e": command_sandbox,
             "validation-profile": command_validation_profile,
             "schedule-tick": command_schedule_tick,

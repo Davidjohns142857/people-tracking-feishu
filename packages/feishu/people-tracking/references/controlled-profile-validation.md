@@ -3,6 +3,34 @@
 控制主页用于区分来源晚更新、轮询迟发现、候选迟确认、审核积压与报告迟交付。
 所有模拟事实必须显示 `[TEST]`，不得合并进真实人物履历或作为真实人才动态发送。
 
+## 上线后的首份回执与半周回执
+
+以安装包入口执行一次。该命令从生产库读取真实覆盖，哪怕当前没有控制主页也会显示缺项。
+
+```bash
+python3 scripts/skill_entry.py debug-status --enable --json
+```
+
+有独立固定 developer 飞书收件人时，宿主执行返回的消息 action，当场投递首份回执。消息必须采用
+返回的 markdown 和 idempotency_key，收到真实 message_id 后与 action 的 delivery_key、
+message_hash 一起写入 JSON，再用 `digest --bridge-results FILE --json` 回填。
+回执未回填会在后续 tick 重试同一份，不达到常规周期也可以完成。使用同一既有调度，每周一 08:00、
+周四 20:00（部署时区）出一份，宿主会在到期后的下一次执行发出。业务抓取、名单或审核阻塞时独立投递。
+
+如果仅配置了公开报告或本地 Markdown，`delivery.status=developer_target_missing`。先在发起升级的
+私聊把返回的 markdown 回复给负责人，随后由他提供固定私聊 `ou_...` 或独立开发群 `oc_...`。
+以以下命令绑定，自动投递仅作用于 debug，不能复用公开报告目标：
+
+```bash
+python3 scripts/skill_entry.py debug-status --enable --target-kind user --target-id ou_EXAMPLE --json
+```
+
+日常按需运行不带 `--enable` 的 `debug-status --json` 查看当前数据。84 小时内观察覆盖与当前启用数分别
+计算；首次基线与解析失败不算已完成变化比较。控制页回执分别记录到期时间、抓取尝试、HTTP 状态、带
+版本标记的最近 200 响应、首次发现、确认和事实审核。304 不写成重新读取正文。synthetic 测试从最终
+公开报告排除，仍可看到正常事实审核结果。通过本地发布日志（含版本、公开回读时间）及 origin/CDN
+访问记录补充对照。只有已经收到真正固定投递的回执才能确认投递；若连回执都没收到，从独立端检查。
+
 ## 证据与范围
 
 - `injected_at`：本地 HTML 变更已准备好；不能冒充远端页面上线时间。
@@ -46,7 +74,9 @@ python3 scripts/skill_entry.py validation-profile registration \
 调度预算设定，不能为了使测试通过而自动放宽。origin 持续托管同一个 `public/` 目录，或每次注入
 后执行真实发布与回读；上传一次静态副本不会自动随本地文件更新。
 
-2. 目标 Agent 将 `registration.json` 的显式测试行登记到同一套系统使用的验证名单，完成正常
+2. 本地保留 `registration.json` 作为 debug 名单。目标 Agent 将其中的测试行登记到实际生产 runner
+   同步的飞书名单，按生产字段映射使用 Name、Homepage、ID（第二 ID）；姓名保持 `[TEST] ` 前缀，
+   不改动或复用真实人物档案。完成正常
    source 同步与基线采集。保留 `record_id/source_id/source_url/readback_at/evidence_ref`，写入
    回执 JSON 后执行 `validation-profile record-receipt --root ROOT --input FILE --json`。
    回执前不得声称自动加名单已完成；不使用正式人物身份来承载模拟履历。
@@ -56,6 +86,9 @@ python3 scripts/skill_entry.py validation-profile registration \
    `decision` 应包含正常算法的 `status/health_status/additions/modifications/removals`。
    执行 `validation-profile import-observations --root ROOT --input FILE --json`。
    不得将本地 smoke 记录改名后当作生产证据。
+   已存在本地 profile 时，可用 `validation-profile bind-origin --root ROOT --public-url URL` 绑定
+   正在服务该 public 目录的地址。线上使用 `debug-status --control-source-id SOURCE_ID --json`
+   导出同一测试行的 `registration` 及 `observations`，分别保存这两个 JSON 值后导入本地。
 
 4. 在已有、已授权的宿主维护 tick 中定期调用：
 
@@ -70,6 +103,8 @@ remote tick 不代替生产 runner 抓取；它仅依据真实导入的基线与
 `event_id/published_at/source_url/evidence_ref`，执行
 `validation-profile record-publication --root ROOT --input FILE --json`。
 无变化对照也需要发布/读取同一页面的时间凭据，不能用发布前的旧观察来判通过。
+默认远程轮换创业、任职、无变化三种场景；也可显式 `advance --scenario startup` 或
+`--scenario job_change`。只在真实线上 baseline 完成后发布变化。
 
 5. 持续导入目标观察，检查：
 

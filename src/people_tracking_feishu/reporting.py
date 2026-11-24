@@ -13,6 +13,7 @@ from urllib.parse import quote, urlsplit
 from zoneinfo import ZoneInfo
 
 from .state import PortableState, stable_hash, utc_now
+from .debug_status import is_debug_name
 
 
 PUBLIC_DECISION_SCHEMA = "people-tracking-agent-review-v1"
@@ -702,6 +703,8 @@ def _review_request_payload(event: dict[str, Any]) -> tuple[str, dict[str, Any]]
         ),
     }
     career_search = event["payload"].get("career_search")
+    if event["payload"].get("debug_only"):
+        evidence["debug_only"] = True
     if isinstance(career_search, dict):
         evidence["career_search"] = career_search
     encoded = json.dumps(
@@ -772,6 +775,8 @@ def _project_signal(
     payload = _event_payload(
         row, action=action, item=item, classification=classification
     )
+    if is_debug_name(row["canonical_name"]):
+        payload["debug_only"] = True
     if career:
         payload["career_evidence"] = True
     # Deterministic logic may reject hard noise, but it can only

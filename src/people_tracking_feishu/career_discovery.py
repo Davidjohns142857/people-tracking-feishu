@@ -172,7 +172,8 @@ def _ensure_schema(db) -> None:
 def _active_people(db) -> list[dict[str, Any]]:
     return [dict(row) for row in db.execute(
         """SELECT p.person_key,p.canonical_name,p.aliases_json,p.profile_json FROM people p
-        WHERE EXISTS(SELECT 1 FROM sources s WHERE s.person_key=p.person_key AND s.tracking_enabled=1)
+        WHERE p.canonical_name NOT LIKE '[TEST] %'
+          AND EXISTS(SELECT 1 FROM sources s WHERE s.person_key=p.person_key AND s.tracking_enabled=1)
         ORDER BY p.person_key"""
     )]
 

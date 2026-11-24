@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from .debug_status import is_debug_name, record_fetch
+
 import hashlib
 import json
 import math
@@ -583,7 +585,7 @@ def scan_due(
     timing: dict[str, float] = {}
     opportunities: dict[str, int] = {}
     enabled_sources = [
-        {**source, "person_key": person["person_key"]}
+        {**source, "person_key": person["person_key"], "canonical_name": person["canonical_name"]}
         for person in state.tracker.list_people()
         for source in person["sources"]
         if int(source.get("tracking_enabled", 1)) == 1
@@ -664,6 +666,8 @@ def scan_due(
                 scholar_budget["attempted"] += 1
                 _record_scholar_attempt(state, at=datetime.now(timezone.utc))
             fetch_started = perf_counter()
+            debug_fetch = source.get("kind") == "homepage" and is_debug_name(source.get("canonical_name", ""))
+            debug_attempted_at = datetime.now(timezone.utc).isoformat() if debug_fetch else None
             try:
                 observation, retries, waited = _fetch_with_policy(
                     source,
@@ -674,6 +678,8 @@ def scan_due(
                 homepage_retry_wait_seconds += waited
                 observation = recovery.recover(source, observation, _fetch)
             except Exception as exc:
+                if debug_attempted_at:
+                    record_fetch(state, source, debug_attempted_at, None)
                 observation_errors.append(
                     {
                         "source_id": source["source_id"],
@@ -688,6 +694,8 @@ def scan_due(
                 timing["fetch_seconds"] = timing.get("fetch_seconds", 0.0) + (
                     perf_counter() - fetch_started
                 )
+            if debug_attempted_at:
+                record_fetch(state, source, debug_attempted_at, observation)
             if source.get("kind") == "scholar":
                 if int(observation.status_code or 0) == 429:
                     scholar_budget["stopped_on_429"] = True

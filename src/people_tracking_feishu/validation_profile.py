@@ -29,6 +29,7 @@ from people_intel.light_tracker import FetchObservation, LightTracker
 
 SCHEMA = "people-tracking-controlled-profile-v1"
 SCENARIOS = ("current", "historical_backfill", "undated", "no_change")
+CAREER_SCENARIOS = ("startup", "job_change")
 
 
 def _now() -> str:
@@ -97,12 +98,15 @@ def _locked(root: Path) -> Iterator[dict[str, Any]]:
 
 
 def _render(root: Path, manifest: dict[str, Any]) -> None:
-    rows = []
+    rows, roles = [], []
+    version = f"CTRL-{manifest['instance_id'][:8]}-00000"
     for event in _records(root / "injections.jsonl"):
         if event["scenario"] == "no_change":
             continue
+        version = event["event_id"]
         date = f", published {event['event_date']}" if event["event_date"] else ""
-        rows.append(
+        destination = roles if event["scenario"] in CAREER_SCENARIOS else rows
+        destination.append(
             f'<p><a href="https://example.invalid/controlled/{event["event_id"]}">'
             f'{html.escape(event["title"])}{html.escape(date)}</a></p>'
         )
@@ -110,7 +114,7 @@ def _render(root: Path, manifest: dict[str, Any]) -> None:
     body = (
         '<!doctype html><html lang="zh"><head><meta charset="utf-8">'
         '<meta name="robots" content="noindex,nofollow">'
-        f'<title>{name}</title></head><body><main><h1>{name}</h1>'
+        f'<title>{name}</title></head><body><main data-people-tracking-debug-version="{version}"><h1>{name}</h1>'
         '<p>TEST CONTROLLED PROFILE. 此页用于自动跟踪系统验证。以下成果均为模拟测试，'
         '不代表任何真实论文、任职或个人履历。No contact information is published.</p>'
         '<h2>Research</h2><p>Interests: AI/ML research reading; financial research; '
@@ -118,6 +122,7 @@ def _render(root: Path, manifest: dict[str, Any]) -> None:
         '兴趣：AI/ML研究阅读、金融研究、人物信息调研、工具开发。</p>'
         '<h2>Publications</h2><p>Controlled Baseline Reference, Evaluation Systems 2025</p>'
         + "".join(rows)
+        + ("<h2>Experience</h2>" + "".join(roles) if roles else "")
         + '</main></body></html>'
     )
     public = root / "public"
@@ -176,15 +181,19 @@ def init_profile(
 
 
 def _advance(root: Path, manifest: dict[str, Any], scenario: str, at: str) -> dict[str, Any]:
-    if scenario not in SCENARIOS:
+    if scenario not in SCENARIOS + CAREER_SCENARIOS:
         raise ValueError("unknown controlled-profile scenario")
     sequence = manifest["sequence"] + 1
     event_id = f"CTRL-{manifest['instance_id'][:8]}-{sequence:05}"
     event_date = (
         (_time(at) - timedelta(days=30)).date().isoformat()
         if scenario == "historical_backfill"
-        else _time(at).date().isoformat() if scenario == "current" else None
+        else _time(at).date().isoformat() if scenario in ("current", *CAREER_SCENARIOS) else None
     )
+    titles = {
+        "startup": f"I co-founded Controlled Example Studio [TEST] ({event_id})",
+        "job_change": f"I joined Controlled Example Lab as Research Engineer [TEST] ({event_id})",
+    }
     record = _append(root / "injections.jsonl", {
         "event_id": event_id,
         "scenario": scenario,
@@ -192,7 +201,7 @@ def _advance(root: Path, manifest: dict[str, Any], scenario: str, at: str) -> di
         "event_date": event_date,
         "event_date_status": "unknown" if scenario in {"undated", "no_change"} else scenario,
         "expected_page_change": scenario != "no_change",
-        "title": f"Controlled Validation {event_id}, Evaluation Systems 2026 [TEST]",
+        "title": titles.get(scenario, f"Controlled Validation {event_id}, Evaluation Systems 2026 [TEST]"),
     })
     manifest.update(sequence=sequence, next_injection_at=(
         _time(at) + timedelta(seconds=manifest["interval_seconds"])
@@ -219,6 +228,7 @@ def export_registration(root: Path) -> dict[str, Any]:
             "record": {
                 "Name": manifest["display_name"],
                 "Homepage": manifest["public_url"],
+                "ID": "control-debug:" + manifest["instance_id"],
                 "Tracking Status": "Active" if manifest["public_url"] else "Pending deployment",
                 "Record Type": "validation_profile",
                 "Validation Instance": manifest["instance_id"],
@@ -234,7 +244,7 @@ def export_registration(root: Path) -> dict[str, Any]:
                 "host_tick_callable": "people_tracking_feishu.validation_profile.tick_profile",
                 "remote_steps": [
                     "Continuously serve this exact public directory at the declared public HTTPS URL, or publish every mutation using an external writer.",
-                    "Register the explicit [TEST] row in a dedicated validation list, preserve its record_id.",
+                    "Register only the explicit [TEST] row in the roster read by the target runner and preserve its record_id.",
                     "Read back record_id and URL; run ordinary remote collection and retain its real receipts.",
                     "Retain a publication/readback receipt with each event ID and its actual publicly visible published_at; local render time is not remote publication time.",
                     "Invoke tick_profile from the existing authorized host tick; for static-copy hosting publish and read back every refreshed index.html before production latency evaluation.",
@@ -244,6 +254,18 @@ def export_registration(root: Path) -> dict[str, Any]:
         }
         _write(root / "registration.json", result)
         return result
+
+
+def bind_origin(root: Path, public_url: str) -> dict[str, Any]:
+    """Bind a prepared local profile to its actual public origin once."""
+    _validate_public_url(public_url, resolve=False)
+    root = Path(root)
+    with _locked(root) as manifest:
+        if manifest["public_url"] and manifest["public_url"] != public_url:
+            raise ValueError("controlled profile public URL is already bound")
+        manifest["public_url"] = public_url
+        _write(root / "manifest.json", manifest)
+    return export_registration(root)
 
 
 def record_registration_receipt(root: Path, receipt: dict[str, Any]) -> dict[str, Any]:
@@ -382,12 +404,16 @@ def observe_profile(root: Path) -> dict[str, Any]:
 
 
 def _matches_fact(decision: dict[str, Any], event: dict[str, Any]) -> bool:
-    """Match the expected concrete publication, never arbitrary summaries/metadata."""
+    """Match the expected changed item, never arbitrary summaries/metadata."""
     if decision.get("health_status") != "healthy":
         return False
     expected_url = f"https://example.invalid/controlled/{event['event_id']}"
     normalize = lambda text: " ".join(unicodedata.normalize("NFKC", html.unescape(str(text))).split()).casefold()
     expected_title = normalize(event["title"])
+    allowed = (
+        {"position", "affiliation", "identity", "content", "research"}
+        if event["scenario"] in CAREER_SCENARIOS else {"publication"}
+    )
     for key, text_key, id_keys in (
         ("additions", "text", ("stable_id",)),
         ("modifications", "after", ("after_stable_id", "stable_id")),
@@ -396,7 +422,7 @@ def _matches_fact(decision: dict[str, Any], event: dict[str, Any]) -> bool:
         if not isinstance(values, list):
             continue
         for item in values:
-            if not isinstance(item, dict) or item.get("category") != "publication":
+            if not isinstance(item, dict) or item.get("category") not in allowed:
                 continue
             if any(item.get(field) == expected_url for field in id_keys):
                 return True
@@ -543,7 +569,8 @@ def tick_profile(root: Path, *, evidence_source: str = "local") -> dict[str, Any
             )
         injection = None
         if has_baseline and previous_complete and _time(now) >= _time(manifest["next_injection_at"]):
-            scenario = SCENARIOS[manifest["sequence"] % len(SCENARIOS)]
+            rotation = ("startup", "job_change", "no_change") if evidence_source == "remote" else SCENARIOS
+            scenario = rotation[manifest["sequence"] % len(rotation)]
             injection = _advance(root, manifest, scenario, now)
         observation = (
             _observe(root, manifest, manifest["public_url"], _fetch)
